@@ -74,6 +74,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -93,7 +94,8 @@ ONLY_SENDERS = [s.strip().lower() for s in os.environ.get("ONLY_SENDERS", "").sp
 MAX_SENDERS = int(os.environ.get("MAX_SENDERS", "0"))      # 0 = no limit
 MAX_SWEEP = int(os.environ.get("MAX_SWEEP", "0"))          # 0 = no limit; hard cap on messages trashed
 BATCH = 1000          # batchModify ids per call
-META_BATCH = 100      # metadata gets per HTTP batch
+META_BATCH = 50       # metadata gets per HTTP batch (100 tripped Gmail's rate limit)
+META_TRIES = 4        # attempts per message before giving up and holding it
 
 # ---------------------------------------------------------------------------
 # SUPPLEMENTARY SUBJECT GUARD
@@ -346,33 +348,64 @@ def message_ids(gmail, query: str, cap: int = 50000) -> list[str]:
     return ids
 
 
-def fetch_metadata(gmail, ids: list[str]) -> dict[str, dict]:
-    """Subject + labelIds for every id, in batches of META_BATCH."""
+def fetch_metadata(gmail, ids: list[str]) -> tuple[dict[str, dict], list[str], list[str]]:
+    """Subject + labelIds for every id. Returns (metadata, still_unread, errors).
+
+    THE FIRST VERSION SWALLOWED EVERY PER-REQUEST EXCEPTION. Gmail rate-limits a batch of
+    100 metadata gets, the callback dropped those responses on the floor, and the run
+    reported "could not read - held by default" for almost the whole mailbox. Nothing was
+    damaged, because unreadable means held - but the subject gate was doing no work at all
+    and the report was worthless.
+
+    So: smaller batches, every failure retried with backoff, and anything still unread
+    after META_TRIES attempts is returned and reported out loud rather than blending into
+    the held list as though it were a protected message.
+    """
     out: dict[str, dict] = {}
+    pending = list(ids)
+    errors: list[str] = []
 
-    def collect(request_id, response, exception):
-        if exception is not None or not response:
-            return
-        hdrs = {h["name"].lower(): h["value"]
-                for h in response.get("payload", {}).get("headers", [])}
-        out[response["id"]] = {
-            "subject": hdrs.get("subject", ""),
-            "date": hdrs.get("date", "")[:16],
-            "labelIds": response.get("labelIds", []),
-        }
+    for attempt in range(META_TRIES):
+        if not pending:
+            break
+        if attempt:
+            time.sleep(min(2 ** attempt, 8))
+        failed: list[str] = []
 
-    for i in range(0, len(ids), META_BATCH):
-        batch = gmail.new_batch_http_request(callback=collect)
-        for mid in ids[i:i + META_BATCH]:
-            batch.add(gmail.users().messages().get(
-                userId="me", id=mid, format="metadata",
-                metadataHeaders=["Subject", "Date"],
-            ))
-        try:
-            batch.execute()
-        except HttpError as exc:
-            log(f"    metadata batch failed ({exc}) - those messages are held back, not swept")
-    return out
+        def collect(request_id, response, exception):
+            if exception is not None or not response:
+                failed.append(request_id)
+                if exception is not None and len(errors) < 5:
+                    errors.append(str(exception)[:160])
+                return
+            hdrs = {h["name"].lower(): h["value"]
+                    for h in response.get("payload", {}).get("headers", [])}
+            out[request_id] = {
+                "subject": hdrs.get("subject", ""),
+                "date": hdrs.get("date", "")[:16],
+                "labelIds": response.get("labelIds", []),
+            }
+
+        for i in range(0, len(pending), META_BATCH):
+            chunk = pending[i:i + META_BATCH]
+            batch = gmail.new_batch_http_request(callback=collect)
+            for mid in chunk:
+                # request_id = the message id, so the callback knows which one failed.
+                batch.add(gmail.users().messages().get(
+                    userId="me", id=mid, format="metadata",
+                    metadataHeaders=["Subject", "Date"],
+                ), request_id=mid)
+            try:
+                batch.execute()
+            except HttpError as exc:
+                failed.extend(chunk)
+                if len(errors) < 5:
+                    errors.append(str(exc)[:160])
+            time.sleep(0.15)   # stay under the per-user rate limit
+
+        pending = failed
+
+    return out, pending, errors
 
 
 def partition(ids: list[str], meta: dict[str, dict], vocabulary: set[str],
@@ -459,7 +492,8 @@ def main() -> int:
 
     plan = []          # (n_sweep, sender, ids)
     all_held = []      # (sender, subject, date, reason)
-    tot_sweep = tot_held = 0
+    tot_sweep = tot_held = unreadable = 0
+    meta_errors: list[str] = []
 
     for s in senders:
         query = f"from:{s} {NEVER_TOUCH}"
@@ -470,7 +504,12 @@ def main() -> int:
             continue
         if not ids:
             continue
-        meta = fetch_metadata(gmail, ids)
+        meta, unread, errs = fetch_metadata(gmail, ids)
+        if unread:
+            unreadable += len(unread)
+            for e in errs:
+                if e not in meta_errors and len(meta_errors) < 5:
+                    meta_errors.append(e)
         sweepable, held = partition(ids, meta, vocabulary, label_ids)     # GATES 3 + 4
         tot_sweep += len(sweepable)
         tot_held += len(held)
@@ -482,6 +521,19 @@ def main() -> int:
 
     log(f"{'-'*7} {'-'*6}  {'-'*58}")
     log(f"{tot_sweep:>7} {tot_held:>6}  TOTAL across {len(senders)} senders\n")
+
+    if unreadable:
+        pct = 100.0 * unreadable / max(tot_sweep + tot_held, 1)
+        log(f"WARNING: {unreadable} message(s) ({pct:.0f}%) could not be read after "
+            f"{META_TRIES} attempts and are held, not swept.")
+        for e in meta_errors:
+            log(f"    {e}")
+        if pct > 20:
+            log("\nThat is too high to trust. The subject gate cannot judge a message it "
+                "cannot read,")
+            log("so the numbers above understate what is sweepable. Fix the read errors "
+                "before sweeping.")
+        log()
 
     if all_held:
         log(f"HELD BACK - {len(all_held)} message(s) matched a sender on the trash list but")
@@ -502,7 +554,7 @@ def main() -> int:
     log("Sample of what WOULD be swept, from the five largest senders:\n")
     for _n, s, ids in plan[:5]:
         log(f"  {s}")
-        meta = fetch_metadata(gmail, ids[:3])
+        meta, _u, _e = fetch_metadata(gmail, ids[:3])
         for mid in ids[:3]:
             m = meta.get(mid, {})
             log(f"      {m.get('date','')}  {m.get('subject','')[:66]}")
