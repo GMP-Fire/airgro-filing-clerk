@@ -104,6 +104,157 @@ Set as workflow inputs on a manual run, or as `env` in the workflow file:
 | `MAX_EXCEPTIONS` | 5 | Cap on Todoist items per run. |
 | `DRY_RUN` | off | Report only, write nothing. |
 
+## Backlog Sweep
+
+A second, separate workflow: `backlog_sweep.py`, run by hand from Actions. Nothing about
+the nightly Filing Clerk changes.
+
+### The problem it solves
+
+The inbox carries roughly 28,000 threads of accumulated marketing. The Gmail Steward
+clears 50-100 a run and new mail replaces them, so it never catches up — it is bailing
+with a cup. The MCP connector has no bulk operation; the Gmail API does. `batchModify`
+takes 1,000 message ids per call, so the entire backlog is a few dozen calls.
+
+It works from the `trash.from_any` list already in `gmail-rules.json`. Same senders the
+Steward already trashes one at a time. No new list to maintain.
+
+### It trashes, it does not delete
+
+`batchModify` adding the `TRASH` label does exactly what `batchDelete` does visibly, in
+the same number of calls, and stays recoverable in Gmail for 30 days. `batchDelete` is
+irreversible and is not used. There is a test that asserts it is never called.
+
+### Six gates, and why there are six
+
+The first version of this script had four, and a check against the live mailbox before it
+ran found the hole. It matched on **sender**. The Steward's real protection for the mail
+that matters is a **subject** rule evaluated earlier in its order of precedence. That is
+the same shape as the Gmail-filter mistake of 7 September, at a thousand times the scale.
+
+What a sender-only sweep would have trashed, all sitting in the inbox:
+
+| Subject | Sender | On the trash list |
+| --- | --- | --- |
+| Spotify Premium Payment Failure: Update your payment details today | no-reply@spotify.com | yes |
+| Spotify Receipt (×2) | no-reply@spotify.com | yes |
+| 23andMe Password Reset Request | donotreply@23andme.com | yes |
+| Your 23andMe Password Has Been Changed | donotreply@23andme.com | yes |
+| Password reset for Calm | hello@breathe.calm.com | yes |
+| Your Calm subscription receipt | hello@breathe.calm.com | yes |
+
+So the sweep now reads the subject of every candidate before touching anything:
+
+1. **Label check.** Never-touch labels are resolved by name to their real ids, or the run
+   aborts. Gmail does not error on `-label:"Typo"` — the clause silently matches nothing
+   and the mail it was protecting gets swept.
+2. **Sender gate.** Hard abort if a sender sits on the trash list *and* on `protect`,
+   `keep_inbox.*.from_any`, `documents_of_record`, `autofile` or `reading`. That is a
+   contradiction in the rules, not something to resolve automatically.
+3. **Subject gate.** Every candidate's subject is checked against the protected
+   vocabulary. Any hit is held back and printed, never swept.
+4. **Label gate.** Anything carrying `*Action this Day` or `Steward-Suspicious` is held,
+   checked against **raw label ids** rather than trusting the query — `labels_note` in
+   `gmail-rules.json` warns about exactly this. A message whose metadata could not be read
+   is also held: if we cannot see it, we do not know it is safe.
+5. **Report by default.** `sweep` is off unless explicitly set.
+6. **Trash, not delete.** `batchDelete` is never called; there is a test asserting it, by
+   AST rather than grep since the docstring discusses it.
+
+### The subject vocabulary is wider than the Steward's, on purpose
+
+`gmail-rules.json` alone is not enough for a bulk sweep, and the tests prove it against
+real subject lines:
+
+| Real subject in the inbox | Why the Steward's list misses it |
+| --- | --- |
+| Spotify Premium **Payment Failure** | `keep_inbox.money` has "payment failed" |
+| Your 23andMe Password Has Been **Changed** | `keep_inbox.security` has "password reset" |
+| payCity \| **Traffic Fine** Alert | nothing covers traffic fines |
+| Spotify **Receipt** | `money` has invoice, remittance, pro forma — not receipt |
+
+The Steward gets away with those gaps because it looks at 50–100 threads a run with
+judgement behind it. A sweep touching thousands at once has none, so `SWEEP_EXTRA_SUBJECTS`
+in the script widens the net: money and records, fines and officialdom, security, orders
+and delivery, subscriptions, travel. These are **additive** — they change what the sweep
+refuses to touch and nothing about how the Steward behaves.
+
+The asymmetry that sets the bias: a marketing mail held back costs nothing, it just waits
+for the Steward. A trashed password reset or traffic fine is a real loss. When in doubt,
+add the phrase.
+
+**These four phrases are also gaps in `gmail-rules.json` itself.** Worth adding "payment
+failure", "receipt", "traffic fine" and a bare "password" to `keep_inbox` so the Steward
+stops missing them too — that is a config decision, not a code one.
+
+### cutlist-keep is a warning, not an abort
+
+Five senders sit on both `trash.from_any` and `cutlist-keep.json` — gforcegolf,
+theoxpecker, hphpublishing, firefinchapp, golfrsa. `gmail-rules.json` documents this
+twice: they are there because Andrew put them on the trash list himself, and
+`trash.from_any` wins. Treating that as a contradiction would abort every run forever over
+decisions already made. They are swept, and named in their own block in the report so the
+decision stays visible.
+
+Never touched, on every single query:
+
+```
+-is:starred -label:"*Action this Day" -in:sent -in:draft -in:trash -in:spam -label:Steward-Suspicious
+```
+
+### A second token, deliberately
+
+The sweep needs `gmail.modify`. Rather than upgrading the Filing Clerk's token, it gets
+its own under a different secret name:
+
+| Workflow | Secret | Gmail scope | Runs |
+| --- | --- | --- | --- |
+| Filing Clerk | `GOOGLE_REFRESH_TOKEN` | `gmail.readonly` | nightly, unattended |
+| Backlog Sweep | `GOOGLE_REFRESH_TOKEN_SWEEP` | `gmail.modify` | manual only |
+
+The unattended job that runs while you are asleep holds a credential that cannot move a
+message even if the code were wrong. The credential that can move 28,000 of them is only
+ever loaded by a job you started by hand. Do not collapse these into one token.
+
+Mint the second one:
+
+```bash
+cd ~/Downloads/airgro-filing-clerk
+source .venv/bin/activate
+python auth_setup.py --sweep ~/Downloads/client_secret_<the real name>.json
+```
+
+Add the printed `GOOGLE_REFRESH_TOKEN_SWEEP` as a repository secret. `GOOGLE_CLIENT_ID`
+and `GOOGLE_CLIENT_SECRET` are already there and are shared.
+
+### Running it
+
+Actions → **Backlog Sweep** → **Run workflow**.
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `sweep` | off | Off = count and report only. On = move mail to Trash. |
+| `only_senders` | blank | Comma-separated fragments, e.g. `takealot,superbalist`. Blank = all. |
+| `max_senders` | 0 | Cap on senders processed. 0 = no limit. |
+
+`MAX_SWEEP` is also available as an env var — a hard cap on messages trashed in one run.
+Set it to 500 on the first live run.
+
+The order that keeps you out of trouble:
+
+1. Run with everything default. Read the counts and the sample subjects.
+2. Run with `only_senders` set to one large sender and `sweep` **on**. Check Gmail.
+3. Run with `sweep` on and nothing else set.
+
+There is no schedule on this workflow and there should never be one.
+
+### If it takes something it should not
+
+`in:trash from:<sender>` in Gmail, select all, Move to Inbox. Thirty days.
+
+Then add that sender to `protect.from_addresses` in `gmail-rules.json` so gate 2 catches
+it next time — and so the Steward stops trashing it too.
+
 ## A note on the credentials
 
 `GOOGLE_REFRESH_TOKEN` is a long-lived key to your Gmail and Drive. It lives in GitHub Secrets, which are encrypted and not readable back out of the UI, and it is never printed in workflow logs. Treat it like a password: do not commit it, paste it into a chat, or mail it to yourself.
