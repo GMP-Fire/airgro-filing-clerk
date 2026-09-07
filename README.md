@@ -87,10 +87,31 @@ A rule looks like this:
   "id": "fnb-gold-business",
   "from": "noreply@fnb.co.za",
   "subject_any": ["FNB Account Statement"],
+  "attachment_any": ["GOLD BUSINESS ACCOUNT"],
+  "dedupe_on": "number",
   "dest": "04 Banking/FNB Gold Business Account",
   "name": "{date} FNB Gold Business Account Statement {n}.pdf"
 }
 ```
+
+**Routing several accounts that share one sender and subject.** FNB emails every
+account statement from `noreply@fnb.co.za` with the subject "FNB Account Statement",
+so a rule keyed on sender+subject alone catches *every* FNB statement and files them
+all into one folder under one name. `attachment_any` fixes this: the rule only files
+attachments whose filename contains one of its patterns, so one rule per account —
+keyed on the attachment filename prefix — sends each statement to its own folder:
+
+| account | `attachment_any` | `dest` |
+|---|---|---|
+| Gold Business | `GOLD BUSINESS ACCOUNT` | `.../FNB Gold Business Account` |
+| Premier Cheque / Current 62227042405 | `PREMIER CHEQUE ACCOUNT`, `PREMIER_CURRENT`, `62227042405` | `.../FNB Cheque 62227042405` |
+| Fusion Private Wealth | `FUSION_PRIVATE_WEALTH` | `.../FNB Fusion Private Wealth` |
+| Private Wealth Credit Card | `PRIVATE_WEALTH_CREDIT_CARD` | `.../FNB Private Wealth Credit Card` |
+
+`dedupe_on: "number"` skips an attachment whose trailing statement number (`{n}`)
+already exists in the destination, whatever its date prefix — so the same statement
+re-emailed on a later date cannot land as a second copy. Without it, `{date}` falls
+back to the email date, so a re-send produces a new name and a duplicate slips through.
 
 `dest` is relative to the finance root, which is pinned by folder id, so renaming the root itself is safe. **Every folder below it is still matched by title**, so renaming or renumbering a destination folder in Drive without editing `dest` here breaks that rule — the clerk raises a Todoist item and files nothing for it. Name tokens: `{date}` (from the subject line if it carries one, otherwise the email date), `{yyyy-mm}`, `{subject}`, `{n}` (trailing number on the attachment filename — this is what keeps five same-minute FNB statements distinct), `{ref}`, `{provider}`.
 
