@@ -1,0 +1,46 @@
+name: Edit Rules
+
+# Manual only. This writes to gmail-rules.json, which four automations read.
+on:
+  workflow_dispatch:
+    inputs:
+      remove_trash_senders:
+        description: "Comma-separated senders to REMOVE from trash.from_any (exact spelling)"
+        type: string
+        required: true
+      note:
+        description: "One line appended to trash.from_any_note saying why"
+        type: string
+        default: ""
+      apply:
+        description: "Actually write. Leave OFF to see the diff first."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edit-rules
+  cancel-in-progress: false
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Edit gmail-rules.json
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN_SWEEP: ${{ secrets.GOOGLE_REFRESH_TOKEN_SWEEP }}
+          REMOVE_TRASH_SENDERS: ${{ inputs.remove_trash_senders }}
+          NOTE: ${{ inputs.note }}
+          APPLY: ${{ inputs.apply && '1' || '0' }}
+        run: python edit_rules.py
