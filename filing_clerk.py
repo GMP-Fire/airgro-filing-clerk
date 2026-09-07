@@ -223,6 +223,35 @@ class Drive:
     def name_exists(self, parent_id: str, name: str) -> bool:
         return self.find_file(parent_id, name) is not None
 
+    def existing_numbers(self, parent_id: str) -> set[str]:
+        """Trailing statement numbers of the PDFs already in a folder.
+
+        "... Statement 52.pdf" -> "52". Used to dedupe on statement number so a
+        re-emailed statement under a new date does not land as a second copy.
+        """
+        numbers: set[str] = set()
+        page = None
+        while True:
+            resp = (
+                self.svc.files()
+                .list(
+                    q=f"'{parent_id}' in parents and trashed=false "
+                    "and mimeType='application/pdf'",
+                    fields="nextPageToken, files(name)",
+                    pageToken=page,
+                    pageSize=1000,
+                )
+                .execute()
+            )
+            for item in resp.get("files", []):
+                m = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", item["name"])
+                if m:
+                    numbers.add(m.group(1))
+            page = resp.get("nextPageToken")
+            if not page:
+                break
+        return numbers
+
     def upload(self, parent_id: str, name: str, data: bytes, mime: str) -> str:
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=True)
         meta = {"name": name, "parents": [parent_id]}
@@ -391,6 +420,14 @@ class Rule:
     senders: list[str] = field(default_factory=list)
     subject_any: list[str] = field(default_factory=list)
     mailbox: str = "gmail"
+    # Only file attachments whose filename contains one of these (case-insensitive).
+    # Lets several rules share one sender+subject but split by account, keying on the
+    # attachment filename prefix (e.g. "GOLD BUSINESS ACCOUNT" vs "PREMIER CHEQUE").
+    attachment_any: list[str] = field(default_factory=list)
+    # "number" -> skip an attachment whose trailing statement number ({n}) already
+    # exists in dest, regardless of the date prefix. Stops the same statement being
+    # filed twice when it is re-emailed on a later date.
+    dedupe_on: str = ""
 
     @classmethod
     def parse(cls, raw: dict) -> "Rule":
@@ -402,6 +439,8 @@ class Rule:
             senders=[s.lower() for s in senders],
             subject_any=raw.get("subject_any", []),
             mailbox=raw.get("mailbox", "gmail"),
+            attachment_any=raw.get("attachment_any", []),
+            dedupe_on=raw.get("dedupe_on", ""),
         )
 
     def gmail_query(self, after: str) -> str:
@@ -522,6 +561,8 @@ def main() -> int:
             log(f"[{rule.id}] destination missing: {rule.dest}")
             continue
 
+        dest_numbers = drive.existing_numbers(dest_id) if rule.dedupe_on == "number" else set()
+
         for ref in messages:
             if filed_count >= MAX_FILES_PER_RUN:
                 break
@@ -552,6 +593,12 @@ def main() -> int:
                     continue
                 if not filename.lower().endswith(".pdf"):
                     continue
+                if rule.attachment_any and not any(
+                    pat.lower() in filename.lower() for pat in rule.attachment_any
+                ):
+                    # This attachment belongs to a different account rule sharing the
+                    # same sender+subject. Leave it for that rule.
+                    continue
                 attachments.append((filename, attachment_id))
 
             proposed = {
@@ -572,6 +619,29 @@ def main() -> int:
                     continue
 
                 target_name = resolved[filename]
+
+                if rule.dedupe_on == "number":
+                    m = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", filename)
+                    if m and m.group(1) in dest_numbers:
+                        # A statement with this number is already filed (perhaps under
+                        # a different date prefix). Record it and do not file a second.
+                        already.add(dedupe_key)
+                        new_records.append(
+                            {
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "rule": rule.id,
+                                "message_id": ref["id"],
+                                "filename": filename,
+                                "dedupe_key": dedupe_key,
+                                "drive_name": target_name,
+                                "dest": rule.dest,
+                                "outcome": "already_present_number",
+                                "source": "github-actions",
+                            }
+                        )
+                        log(f"[{rule.id}] statement #{m.group(1)} already filed, skipping {filename}")
+                        continue
+
                 if drive.name_exists(dest_id, target_name):
                     # Already there from an interactive session — record it so we
                     # stop reconsidering it, but do not upload a second copy.
