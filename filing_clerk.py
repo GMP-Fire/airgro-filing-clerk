@@ -318,13 +318,23 @@ def render_name(
 ) -> str:
     date = date_from_subject(subject) or msg_date
     trailing = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", attachment_name)
-    ref = re.search(r"#?([A-Z0-9]{3,}-[A-Z0-9-]+)", subject)
+
+    # {ref} is a document reference like Anthropic's 2982-5722-1886. Dates have the
+    # same hyphenated-digits shape, so a subject carrying one produced names like
+    # "2026-04-13 Lancet Pathology Account 2026-04-13.pdf". Reject any candidate
+    # that is a date, or that is simply the date we already resolved.
+    ref_value = ""
+    for cand in re.findall(r"#?([A-Z0-9]{3,}-[A-Z0-9-]+)", subject):
+        if cand == date or re.fullmatch(r"\d{2,4}[-/]\d{1,2}[-/]\d{1,4}", cand):
+            continue
+        ref_value = cand
+        break
     values = {
         "{date}": date,
         "{yyyy-mm}": date[:7],
         "{subject}": slugify(subject),
         "{n}": trailing.group(1) if trailing else "1",
-        "{ref}": ref.group(1) if ref else "",
+        "{ref}": ref_value,
         "{provider}": provider_from_sender(sender),
     }
     out = template
