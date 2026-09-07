@@ -75,6 +75,7 @@ import json
 import os
 import sys
 import time
+from collections import deque
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -129,7 +130,7 @@ META_TRIES = 5        # attempts per message before giving up and holding it
 # When in doubt, add the phrase.
 SWEEP_EXTRA_SUBJECTS = [
     # money and records
-    "receipt", "payment failure", "payment problem", "payment issue", "payment method",
+    "receipt", "payment", "payment failure", "payment problem", "payment issue",
     "billing", "card declined", "card expiring", "update your payment", "update your card",
     "refund", "credit note", "statement", "balance", "arrears", "paid",
     # fines and officialdom
@@ -204,6 +205,69 @@ def credentials() -> Credentials:
 
 
 # --------------------------------------------------------------------------- config
+
+
+
+# ---------------------------------------------------------------------------
+# QUOTA GOVERNOR
+# ---------------------------------------------------------------------------
+# Gmail bills per-user quota in UNITS PER MINUTE, not per second. messages.list and
+# messages.get are 5 units each. The first design read every candidate message one at a
+# time to check its subject: 903 messages = 4,515 units before retries, and 27,000 would be
+# 135,000. On the 12:10 run it exhausted the minute's budget after twelve senders and the
+# other SEVENTY-SIX were logged as errors and skipped - which silently shrank the totals
+# from 903 to 420 and made the whole report a lie by omission.
+#
+# So two changes. Subject matching now happens INSIDE the Gmail query, which turns a
+# thousand individual reads into a handful of searches. And every call goes through this
+# governor, which will not let the process outrun the budget in the first place.
+BUDGET_PER_MIN = int(os.environ.get("GMAIL_UNITS_PER_MIN", "9000"))   # of Gmail's ~15,000
+
+
+class Governor:
+    """Spend Gmail quota at a rate that cannot trip the per-minute limit."""
+
+    def __init__(self, budget: int = BUDGET_PER_MIN):
+        self.budget = budget
+        self.spent: deque[tuple[float, int]] = deque()
+        self.waited = 0.0
+
+    def spend(self, units: int) -> None:
+        while True:
+            now = time.monotonic()
+            while self.spent and now - self.spent[0][0] > 60:
+                self.spent.popleft()
+            if sum(u for _t, u in self.spent) + units <= self.budget:
+                self.spent.append((now, units))
+                return
+            nap = max(0.2, 60 - (now - self.spent[0][0]))
+            self.waited += nap
+            time.sleep(nap)
+
+
+GOV = Governor()
+
+
+def call(request, units: int = 5, tries: int = 6):
+    """Execute one API request, paying for it and retrying a rate limit properly.
+
+    A 403 rateLimitExceeded is transient and must be waited out, NEVER swallowed and never
+    allowed to drop a whole sender. Anything else raises immediately - a 404 or a
+    permission error is not something to retry sixty times.
+    """
+    for attempt in range(tries):
+        GOV.spend(units)
+        try:
+            return request.execute()
+        except HttpError as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            transient = status in (403, 429, 500, 502, 503) and "ateLimit" in str(exc.content)
+            if status in (500, 502, 503):
+                transient = True
+            if not transient or attempt == tries - 1:
+                raise
+            time.sleep(2 ** attempt)   # 1, 2, 4, 8, 16 seconds
+    raise RuntimeError("unreachable")
 
 
 def drive_find(svc, name: str) -> str | None:
@@ -310,6 +374,14 @@ def find_leaks(senders: list[str], protected: set[str]) -> list[tuple[str, str]]
 
 
 def protected_subject_hit(subject: str, vocabulary: set[str]) -> str | None:
+    """Reference implementation of the subject gate, kept for verification.
+
+    Gmail does the real matching now, inside the search query - this is not in the
+    decision path. It stays because the test suite runs it against real subject lines
+    pulled from the mailbox ("Spotify Premium Payment Failure", "23andMe Password Reset
+    Request", "payCity | Traffic Fine Alert") to prove the vocabulary still covers them.
+    Delete the vocabulary's coverage and those tests fail, which is the point.
+    """
     low = (subject or "").lower()
     for phrase in vocabulary:
         if phrase in low:
@@ -326,7 +398,7 @@ def resolve_labels(gmail) -> dict[str, str]:
     gmail-rules.json labels_note: search returns raw label ids, not names, and a
     -label: clause naming a label that does not exist matches nothing silently.
     """
-    labels = gmail.users().labels().list(userId="me").execute().get("labels", [])
+    labels = call(gmail.users().labels().list(userId="me"), units=1).get("labels", [])
     by_name = {l["name"]: l["id"] for l in labels}
     absent = [n for n in NEVER_TOUCH_LABELS if n not in by_name]
     if absent:
@@ -341,27 +413,8 @@ def resolve_labels(gmail) -> dict[str, str]:
     return resolved
 
 
-def message_ids(gmail, query: str, cap: int = 50000) -> list[str]:
-    ids, page = [], None
-    while True:
-        res = gmail.users().messages().list(
-            userId="me", q=query, maxResults=500, pageToken=page
-        ).execute()
-        ids.extend(m["id"] for m in res.get("messages", []))
-        page = res.get("nextPageToken")
-        if not page or len(ids) >= cap:
-            break
-    return ids
-
-
 def describe(exc) -> str:
-    """Gmail's reason string, not 400 characters of URL.
-
-    The first version logged str(exc) truncated to 160 chars, which cut off before the
-    reason and left "HttpError 403 when requesting https://..." - true, and useless. The
-    reason ('rateLimitExceeded' vs 'notFound' vs 'insufficientPermissions') is the entire
-    diagnostic.
-    """
+    """Gmail's reason string, not 400 characters of URL."""
     status = getattr(getattr(exc, "resp", None), "status", "?")
     reason = ""
     try:
@@ -373,98 +426,73 @@ def describe(exc) -> str:
             reason = f"{details[0]['reason']}: {reason}"
     except Exception:
         reason = str(exc)[:120]
-    return f"HTTP {status}  {reason[:160]}"
+    return f"HTTP {status}  {reason[:170]}"
 
 
-def fetch_metadata(gmail, ids: list[str]) -> tuple[dict[str, dict], list[str], list[str]]:
-    """Subject + labelIds for every id. Returns (metadata, still_unread, errors).
+def subject_clauses(vocabulary: set[str], per_query: int = 15) -> list[str]:
+    """Turn the protected vocabulary into a few Gmail subject: OR-groups.
 
-    THE FIRST VERSION SWALLOWED EVERY PER-REQUEST EXCEPTION. Gmail rate-limits a batch of
-    100 metadata gets, the callback dropped those responses on the floor, and the run
-    reported "could not read - held by default" for almost the whole mailbox. Nothing was
-    damaged, because unreadable means held - but the subject gate was doing no work at all
-    and the report was worthless.
+    Gmail strips punctuation, so a phrase like "% off" collapses to the single word "off"
+    and would match most retail marketing. That errs towards holding, which is the safe
+    direction, but it is worth knowing. Phrases are quoted so multi-word ones match as
+    phrases rather than as loose words.
+    """
+    phrases = sorted(p for p in vocabulary if p.strip())
+    return [
+        "subject:(" + " OR ".join(f'"{p}"' for p in phrases[i:i + per_query]) + ")"
+        for i in range(0, len(phrases), per_query)
+    ]
 
-    So: smaller batches, every failure retried with backoff, and anything still unread
-    after META_TRIES attempts is returned and reported out loud rather than blending into
-    the held list as though it were a protected message.
+
+def list_ids(gmail, query: str, cap: int = 100000) -> list[str]:
+    """Every message id matching a query, paged, paid for, and rate-limit-aware."""
+    ids, page = [], None
+    while True:
+        res = call(gmail.users().messages().list(
+            userId="me", q=query, maxResults=500, pageToken=page))
+        ids.extend(m["id"] for m in res.get("messages", []))
+        page = res.get("nextPageToken")
+        if not page or len(ids) >= cap:
+            break
+    return ids
+
+
+def assess(gmail, sender: str, clauses: list[str]) -> tuple[list[str], list[str]]:
+    """Split one sender's mail into (sweepable, held_by_subject).
+
+    One search for everything from the sender, then one search per subject group. What the
+    subject searches return is protected; the remainder is sweepable. Gmail does the
+    matching, so this costs a handful of searches instead of one read per message.
+    """
+    base = f"from:{sender} {NEVER_TOUCH}"
+    everything = list_ids(gmail, base)
+    if not everything:
+        return [], []
+    held: set[str] = set()
+    for clause in clauses:
+        held.update(list_ids(gmail, f"{base} {clause}"))
+    return [i for i in everything if i not in held], sorted(held)
+
+
+def fetch_metadata(gmail, ids: list[str]) -> dict[str, dict]:
+    """Subject + date for a SMALL set of ids - reporting only, never the gate.
+
+    Capped by the caller. This is what samples look like in the report; the decision about
+    what may be swept is made by Gmail in assess(), not here.
     """
     out: dict[str, dict] = {}
-    pending = list(ids)
-    errors: list[str] = []
-
-    for attempt in range(META_TRIES):
-        if not pending:
-            break
-        if attempt:
-            # 1, 2, 4, 8 seconds. A rate limit clears in well under that; anything still
-            # failing after the fourth wait is not transient and gets reported, not hidden.
-            time.sleep(2 ** (attempt - 1))
-        failed: list[str] = []
-
-        def collect(request_id, response, exception):
-            if exception is not None or not response:
-                failed.append(request_id)
-                if exception is not None and len(errors) < 5:
-                    errors.append(describe(exception))
-                return
-            hdrs = {h["name"].lower(): h["value"]
-                    for h in response.get("payload", {}).get("headers", [])}
-            out[request_id] = {
-                "subject": hdrs.get("subject", ""),
-                "date": hdrs.get("date", "")[:16],
-                "labelIds": response.get("labelIds", []),
-            }
-
-        for i in range(0, len(pending), META_BATCH):
-            chunk = pending[i:i + META_BATCH]
-            batch = gmail.new_batch_http_request(callback=collect)
-            for mid in chunk:
-                # request_id = the message id, so the callback knows which one failed.
-                batch.add(gmail.users().messages().get(
-                    userId="me", id=mid, format="metadata",
-                    metadataHeaders=["Subject", "Date"],
-                ), request_id=mid)
-            try:
-                batch.execute()
-            except HttpError as exc:
-                failed.extend(chunk)
-                if len(errors) < 5:
-                    errors.append(describe(exc))
-            time.sleep(META_PAUSE)   # stay under the 250 units/second per-user ceiling
-
-        pending = failed
-
-    return out, pending, errors
-
-
-def partition(ids: list[str], meta: dict[str, dict], vocabulary: set[str],
-              label_ids: dict[str, str]) -> tuple[list[str], list[tuple[str, str, str]]]:
-    """Split candidates into (sweepable, held).
-
-    A message with no metadata is HELD, never swept - if we could not read it, we do not
-    know whether it is protected.
-    """
-    guarded = set(label_ids.values())
-    sweepable: list[str] = []
-    held: list[tuple[str, str, str]] = []   # (subject, date, reason)
-
     for mid in ids:
-        m = meta.get(mid)
-        if m is None:
-            held.append(("(metadata unavailable)", "", "could not read - held by default"))
+        try:
+            m = call(gmail.users().messages().get(
+                userId="me", id=mid, format="metadata",
+                metadataHeaders=["Subject", "Date"]))
+        except HttpError:
             continue
-        carried = guarded.intersection(m["labelIds"])
-        if carried:
-            names = [n for n, i in label_ids.items() if i in carried]
-            held.append((m["subject"][:66], m["date"], "label " + ", ".join(names)))
-            continue
-        hit = protected_subject_hit(m["subject"], vocabulary)
-        if hit:
-            held.append((m["subject"][:66], m["date"], f'subject "{hit}"'))
-            continue
-        sweepable.append(mid)
-    return sweepable, held
+        hdrs = {h["name"].lower(): h["value"] for h in m.get("payload", {}).get("headers", [])}
+        out[mid] = {"subject": hdrs.get("subject", ""),
+                    "date": hdrs.get("date", "")[:16],
+                    "labelIds": m.get("labelIds", [])}
+    return out
 
 
 # --------------------------------------------------------------------------- main
@@ -520,61 +548,57 @@ def main() -> int:
     log(f"{'sweep':>7} {'held':>6}  sender")
     log(f"{'-'*7} {'-'*6}  {'-'*58}")
 
-    plan = []          # (n_sweep, sender, ids)
-    all_held = []      # (sender, subject, date, reason)
-    tot_sweep = tot_held = unreadable = 0
-    meta_errors: list[str] = []
+    clauses = subject_clauses(vocabulary)
+    log(f"         as {len(clauses)} Gmail subject queries per sender.\n")
 
-    for s in senders:
-        query = f"from:{s} {NEVER_TOUCH}"
+    plan = []            # (n_sweep, sender, sweepable_ids)
+    held_by_sender = []  # (sender, [ids])
+    unassessed = []      # (sender, error) - NEVER swept, always reported
+    tot_sweep = tot_held = 0
+
+    for s_ in senders:
         try:
-            ids = message_ids(gmail, query)
+            sweepable, held = assess(gmail, s_, clauses)
         except HttpError as exc:
-            log(f"{'ERR':>7} {'':>6}  {s}  ({exc})")
+            unassessed.append((s_, describe(exc)))
+            log(f"{'SKIP':>7} {'':>6}  {s_}  (could not assess - NOT swept)")
             continue
-        if not ids:
+        if not sweepable and not held:
             continue
-        meta, unread, errs = fetch_metadata(gmail, ids)
-        if unread:
-            unreadable += len(unread)
-            for e in errs:
-                if e not in meta_errors and len(meta_errors) < 5:
-                    meta_errors.append(e)
-        sweepable, held = partition(ids, meta, vocabulary, label_ids)     # GATES 3 + 4
         tot_sweep += len(sweepable)
         tot_held += len(held)
-        for subj, date, reason in held:
-            all_held.append((s, subj, date, reason))
+        if held:
+            held_by_sender.append((s_, held))
         if sweepable:
-            plan.append((len(sweepable), s, sweepable))
-        log(f"{len(sweepable):>7} {len(held):>6}  {s}")
+            plan.append((len(sweepable), s_, sweepable))
+        log(f"{len(sweepable):>7} {len(held):>6}  {s_}")
 
     log(f"{'-'*7} {'-'*6}  {'-'*58}")
-    log(f"{tot_sweep:>7} {tot_held:>6}  TOTAL across {len(senders)} senders\n")
+    log(f"{tot_sweep:>7} {tot_held:>6}  TOTAL across {len(senders)} senders")
+    log(f"Quota: waited {GOV.waited:.0f}s to stay inside {BUDGET_PER_MIN} units/min.\n")
 
-    if unreadable:
-        pct = 100.0 * unreadable / max(tot_sweep + tot_held, 1)
-        log(f"WARNING: {unreadable} message(s) ({pct:.0f}%) could not be read after "
-            f"{META_TRIES} attempts and are held, not swept.")
-        for e in meta_errors:
-            log(f"    {e}")
-        if pct > 20:
-            log("\nThat is too high to trust. The subject gate cannot judge a message it "
-                "cannot read,")
-            log("so the numbers above understate what is sweepable. Fix the read errors "
-                "before sweeping.")
-        log()
+    if unassessed:
+        log(f"WARNING: {len(unassessed)} sender(s) could not be assessed and were NOT swept:")
+        for s_, err in unassessed[:10]:
+            log(f"    {s_}  -  {err}")
+        log("Their mail is untouched. Re-run to pick them up.\n")
 
-    if all_held:
-        log(f"HELD BACK - {len(all_held)} message(s) matched a sender on the trash list but")
-        log("are protected by subject or label. These are NEVER swept:\n")
-        for sender, subj, date, reason in all_held[:60]:
-            log(f"  [{reason}]")
-            log(f"      {date}  {subj}")
-            log(f"      from {sender}")
-        if len(all_held) > 60:
-            log(f"  ... and {len(all_held) - 60} more")
-        log()
+    if held_by_sender:
+        shown = sum(len(h) for _s, h in held_by_sender)
+        log(f"HELD BACK - {shown} message(s) from a trash-list sender, protected by subject.")
+        log("These are never swept. A sample:\n")
+        budget = 30
+        for s_, ids in sorted(held_by_sender, key=lambda x: -len(x[1])):
+            if budget <= 0:
+                break
+            take = ids[:min(3, budget)]
+            budget -= len(take)
+            log(f"  {s_}  ({len(ids)} held)")
+            meta = fetch_metadata(gmail, take)
+            for mid in take:
+                m = meta.get(mid, {})
+                log(f"      {m.get('date','')}  {m.get('subject','')[:66]}")
+            log()
 
     if not plan:
         log("Nothing to sweep.")
@@ -582,9 +606,9 @@ def main() -> int:
 
     plan.sort(reverse=True)
     log("Sample of what WOULD be swept, from the five largest senders:\n")
-    for _n, s, ids in plan[:5]:
-        log(f"  {s}")
-        meta, _u, _e = fetch_metadata(gmail, ids[:3])
+    for _n, s_, ids in plan[:5]:
+        log(f"  {s_}  ({_n} sweepable)")
+        meta = fetch_metadata(gmail, ids[:3])
         for mid in ids[:3]:
             m = meta.get(mid, {})
             log(f"      {m.get('date','')}  {m.get('subject','')[:66]}")
@@ -599,7 +623,7 @@ def main() -> int:
 
     log("SWEEPING - adding the TRASH label. Recoverable in Gmail for 30 days.\n")
     swept = 0
-    for _n, s, ids in plan:                                                # GATE 6
+    for _n, s_, ids in plan:                                               # GATE 6
         if MAX_SWEEP and swept >= MAX_SWEEP:
             log(f"  MAX_SWEEP of {MAX_SWEEP} reached - stopping here.")
             break
@@ -607,16 +631,16 @@ def main() -> int:
             ids = ids[:MAX_SWEEP - swept]
         for i in range(0, len(ids), BATCH):
             chunk = ids[i:i + BATCH]
-            gmail.users().messages().batchModify(
+            call(gmail.users().messages().batchModify(
                 userId="me",
                 body={"ids": chunk,
                       "addLabelIds": ["TRASH"],
                       "removeLabelIds": ["INBOX", "UNREAD"]},
-            ).execute()
+            ), units=50)
             swept += len(chunk)
-        log(f"  swept {len(ids):>6} from {s}")
+        log(f"  swept {len(ids):>6} from {s_}")
 
-    log(f"\nDone. {swept} messages moved to Trash. {tot_held} held back by the subject and label gates.")
+    log(f"\nDone. {swept} messages moved to Trash. {tot_held} held back by the subject gate.")
     log("Recoverable for 30 days: search in:trash in Gmail.")
     return 0
 
