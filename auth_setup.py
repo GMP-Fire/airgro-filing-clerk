@@ -15,6 +15,17 @@ machine is shut.
     # the manual Backlog Sweep -- can move mail to Trash
     python auth_setup.py --sweep /path/to/client_secret.json
 
+    # mint, verify and store the sweep secret with NO copy-paste at all
+    python auth_setup.py --sweep --token-only client_secret.json \
+        | gh secret set GOOGLE_REFRESH_TOKEN_SWEEP
+
+--token-only prints the refresh token and NOTHING else to stdout, so it can be piped
+straight into `gh secret set`. Every message goes to stderr instead. Before it prints
+anything it USES the token for a real API call; if that fails it prints nothing and exits
+non-zero, so a broken token can never reach GitHub. This exists because a hand-pasted
+token produced `invalid_grant: Bad Request` on 2026-09-07 -- a paste that picks up a line
+break or drops a character looks fine on screen and fails in the runner.
+
 TWO TOKENS, DELIBERATELY
 ------------------------
 The Filing Clerk runs unattended every night and only ever reads mail, so its token is
@@ -39,10 +50,39 @@ READONLY_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", DRIVE]
 SWEEP_SCOPES = ["https://www.googleapis.com/auth/gmail.modify", DRIVE]
 
 
+def verify(refresh_token: str, client_id: str, client_secret: str, scopes: list[str]) -> bool:
+    """Use the token for real before letting it anywhere near GitHub Secrets.
+
+    A refresh that succeeds plus a Gmail profile call proves the token is complete, matches
+    this client, and carries the scopes the workflow needs. Anything less and we print
+    nothing, so the secret is never set to something broken.
+    """
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials(
+        token=None, refresh_token=refresh_token,
+        client_id=client_id, client_secret=client_secret,
+        token_uri="https://oauth2.googleapis.com/token", scopes=scopes,
+    )
+    try:
+        creds.refresh(Request())
+        profile = build("gmail", "v1", credentials=creds,
+                        cache_discovery=False).users().getProfile(userId="me").execute()
+    except Exception as exc:
+        print(f"VERIFICATION FAILED: {exc}", file=sys.stderr)
+        return False
+    print(f"Verified against {profile.get('emailAddress')} "
+          f"({profile.get('messagesTotal')} messages).", file=sys.stderr)
+    return True
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:]]
     sweep = "--sweep" in args
-    args = [a for a in args if a != "--sweep"]
+    token_only = "--token-only" in args
+    args = [a for a in args if a not in ("--sweep", "--token-only")]
 
     if not args:
         print(__doc__)
@@ -52,13 +92,14 @@ def main() -> int:
     scopes = SWEEP_SCOPES if sweep else READONLY_SCOPES
     token_name = "GOOGLE_REFRESH_TOKEN_SWEEP" if sweep else "GOOGLE_REFRESH_TOKEN"
 
-    print(f"\nMinting {token_name}")
-    print("Scopes: " + ", ".join(s.rsplit('/', 1)[-1] for s in scopes))
+    out = sys.stderr if token_only else sys.stdout
+    print(f"\nMinting {token_name}", file=out)
+    print("Scopes: " + ", ".join(s.rsplit('/', 1)[-1] for s in scopes), file=out)
     if sweep:
-        print("This token CAN move your mail to Trash. It is used only by the manual")
-        print("Backlog Sweep workflow, never by the nightly Filing Clerk.\n")
+        print("This token CAN move your mail to Trash. It is used only by the manual", file=out)
+        print("Backlog Sweep workflow, never by the nightly Filing Clerk.\n", file=out)
     else:
-        print("This token can only READ your mail.\n")
+        print("This token can only READ your mail.\n", file=out)
 
     flow = InstalledAppFlow.from_client_secrets_file(secrets_path, scopes)
     # access_type=offline + prompt=consent is what actually produces a refresh
@@ -67,13 +108,23 @@ def main() -> int:
     creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
 
     if not creds.refresh_token:
-        print("\nNo refresh token came back. Revoke the app's access at")
-        print("https://myaccount.google.com/permissions and run this again.")
+        print("\nNo refresh token came back. Revoke the app's access at", file=out)
+        print("https://myaccount.google.com/permissions and run this again.", file=out)
         return 1
 
     with open(secrets_path) as fh:
         installed = json.load(fh)
     client = installed.get("installed") or installed.get("web") or {}
+
+    if not verify(creds.refresh_token, client.get("client_id", ""),
+                  client.get("client_secret", ""), scopes):
+        print("Nothing was printed and nothing was stored. Run it again.", file=sys.stderr)
+        return 1
+
+    if token_only:
+        # stdout carries the token and nothing else, so this can be piped into gh.
+        sys.stdout.write(creds.refresh_token)
+        return 0
 
     print("\n" + "=" * 70)
     print("Add these as GitHub repository secrets")
