@@ -268,6 +268,51 @@ def provider_from_sender(sender: str) -> str:
     return ""
 
 
+def attachment_label(filename: str) -> str:
+    """A human label distinguishing sibling attachments in one email."""
+    low = filename.lower()
+    for key, label in (
+        ("receipt", "Receipt"),
+        ("invoice", "Invoice"),
+        ("statement", "Statement"),
+        ("summary", "Summary"),
+    ):
+        if key in low:
+            return label
+    return ""
+
+
+def disambiguate(names: dict[str, str]) -> dict[str, str]:
+    """Make every target name in one message unique.
+
+    Several senders attach more than one PDF to a single email - Anthropic sends an
+    invoice and a receipt, Ninety One sends one statement per fund - and the rule's
+    name template often renders them identically. Left alone the first would upload
+    and the second would hit the 'already in Drive' check and be recorded as filed
+    without ever being written. That is silent data loss, so it must not be possible.
+
+    Keyed by source attachment filename, so the result is stable across runs and does
+    not depend on the order Gmail happens to return parts in.
+    """
+    groups: dict[str, list[str]] = {}
+    for source, target in names.items():
+        groups.setdefault(target, []).append(source)
+
+    out: dict[str, str] = {}
+    for target, sources in groups.items():
+        if len(sources) == 1:
+            out[sources[0]] = target
+            continue
+        sources = sorted(sources)
+        labels = [attachment_label(s) for s in sources]
+        use_labels = all(labels) and len(set(labels)) == len(labels)
+        stem, _, ext = target.rpartition(".")
+        for i, source in enumerate(sources, start=1):
+            suffix = f" - {labels[i - 1]}" if use_labels else f" ({i})"
+            out[source] = f"{stem}{suffix}.{ext}"
+    return out
+
+
 def render_name(
     template: str, *, msg_date: str, subject: str, attachment_name: str, sender: str = ""
 ) -> str:
@@ -451,26 +496,36 @@ def main() -> int:
                 int(msg["internalDate"]) / 1000, tz=timezone.utc
             ).strftime("%Y-%m-%d")
 
+            # Collect every PDF in the message FIRST, so sibling attachments that
+            # render to the same name can be told apart before anything uploads.
+            attachments: list[tuple[str, str]] = []
             for part in walk_parts(msg["payload"]):
                 filename = part.get("filename") or ""
-                body = part.get("body", {})
-                attachment_id = body.get("attachmentId")
+                attachment_id = part.get("body", {}).get("attachmentId")
                 if not filename or not attachment_id:
                     continue
                 if not filename.lower().endswith(".pdf"):
                     continue
+                attachments.append((filename, attachment_id))
 
-                dedupe_key = f"{ref['id']}::{filename}"
-                if dedupe_key in already:
-                    continue
-
-                target_name = render_name(
+            proposed = {
+                filename: render_name(
                     rule.name,
                     msg_date=msg_date,
                     subject=subject,
                     attachment_name=filename,
                     sender=sender,
                 )
+                for filename, _ in attachments
+            }
+            resolved = disambiguate(proposed)
+
+            for filename, attachment_id in attachments:
+                dedupe_key = f"{ref['id']}::{filename}"
+                if dedupe_key in already:
+                    continue
+
+                target_name = resolved[filename]
                 if drive.name_exists(dest_id, target_name):
                     # Already there from an interactive session — record it so we
                     # stop reconsidering it, but do not upload a second copy.
