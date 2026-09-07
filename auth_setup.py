@@ -40,7 +40,9 @@ paste it into a chat, or email it to yourself. It goes straight into GitHub Secr
 nowhere else.
 """
 
+import contextlib
 import json
+import re
 import sys
 
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -105,7 +107,15 @@ def main() -> int:
     # access_type=offline + prompt=consent is what actually produces a refresh
     # token. Without prompt=consent Google will skip it on a repeat authorisation
     # and you will get an access token that expires in an hour.
-    creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+    #
+    # run_local_server() PRINTS "Please visit this URL to authorize..." TO STDOUT.
+    # Under --token-only that prompt and the auth URL went down the pipe ahead of the
+    # token, so `gh secret set` stored the whole lot and the runner got invalid_grant --
+    # while local verification passed, because it checked the token in memory rather than
+    # the bytes being piped. Everything the flow prints now goes to stderr; stdout is
+    # reserved for the token alone.
+    with contextlib.redirect_stdout(sys.stderr):
+        creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
 
     if not creds.refresh_token:
         print("\nNo refresh token came back. Revoke the app's access at", file=out)
@@ -122,8 +132,18 @@ def main() -> int:
         return 1
 
     if token_only:
+        # Last line of defence: whatever reaches stdout must LOOK like a bare refresh
+        # token - one opaque string, no whitespace, no URL, nothing else. If it does not,
+        # print nothing rather than let `gh secret set` store rubbish.
+        token = creds.refresh_token
+        if (not re.fullmatch(r"[A-Za-z0-9._~+/=-]{20,}", token)
+                or "http" in token or "\n" in token):
+            print("REFUSING TO PRINT: the token does not look like a bare refresh token.",
+                  file=sys.stderr)
+            print("Nothing was written to stdout, so no secret was set.", file=sys.stderr)
+            return 1
         # stdout carries the token and nothing else, so this can be piped into gh.
-        sys.stdout.write(creds.refresh_token)
+        sys.stdout.write(token)
         return 0
 
     print("\n" + "=" * 70)

@@ -134,9 +134,20 @@ def main() -> int:
         return 0
 
     # Backup first, in the same folder, before the original is touched.
+    #
+    # THE NAME MATTERS. The first version called it "gmail-rules.backup-<stamp>.json",
+    # which put a second file containing the string "gmail-rules" next to the real one.
+    # This code matches filenames exactly so it was unaffected - but the Gmail Steward is a
+    # language model using the Drive connector, and a title-contains search would return
+    # both and could read a stale backup as the live rule table. That is the same
+    # duplicate-config hazard the Filing Clerk aborts on, introduced by the safety net.
+    #
+    # So backups carry a name that shares no searchable substring with the file they
+    # protect, and say plainly in the name what they are.
     body = json.dumps(before, indent=2, ensure_ascii=False).encode("utf-8")
     backup = drive.files().create(
-        body={"name": f"gmail-rules.backup-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json",
+        body={"name": f"ARCHIVED-rule-table-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+                      f"-DO-NOT-READ.json",
               "parents": parents},
         media_body=MediaInMemoryUpload(body, mimetype="application/json"),
         fields="id,name").execute()
