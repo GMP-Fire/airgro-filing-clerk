@@ -145,12 +145,16 @@ SWEEP_EXTRA_SUBJECTS = [
     "check-in", "flight",
 ]
 
-NEVER_TOUCH_LABELS = ["*Action this Day", "Steward-Suspicious"]
+# EXACT label names as they exist in the mailbox. Verified against users.labels.list on
+# 2026-09-07: "*Action this Day" = Label_2308127286056104914, "Steward/Suspicious" = Label_38.
+# The first version wrote "Steward-Suspicious" with a hyphen. Gate 1 caught it on the first
+# run; a query clause naming it would have protected nothing at all, silently.
+NEVER_TOUCH_LABELS = ["*Action this Day", "Steward/Suspicious"]
 NEVER_TOUCH = (
     '-is:starred '
     '-label:"*Action this Day" '
     '-in:sent -in:draft -in:trash -in:spam '
-    '-label:Steward-Suspicious'
+    '-label:"Steward/Suspicious"'
 )
 
 
