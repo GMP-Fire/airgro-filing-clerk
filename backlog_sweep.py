@@ -94,8 +94,14 @@ ONLY_SENDERS = [s.strip().lower() for s in os.environ.get("ONLY_SENDERS", "").sp
 MAX_SENDERS = int(os.environ.get("MAX_SENDERS", "0"))      # 0 = no limit
 MAX_SWEEP = int(os.environ.get("MAX_SWEEP", "0"))          # 0 = no limit; hard cap on messages trashed
 BATCH = 1000          # batchModify ids per call
-META_BATCH = 50       # metadata gets per HTTP batch (100 tripped Gmail's rate limit)
-META_TRIES = 4        # attempts per message before giving up and holding it
+# GMAIL QUOTA ARITHMETIC, and why these numbers are what they are.
+# messages.get costs 5 quota units. The per-user ceiling is 250 units per second. A batch
+# of 50 therefore spends 250 units in one instant and Gmail answers 403 rateLimitExceeded
+# for most of it - which is exactly what happened: 28% of reads failed, every one a 403.
+# 20 per batch = 100 units, one every 0.5s = 200 units/second, a 20% margin under the cap.
+META_BATCH = 20
+META_PAUSE = 0.5      # seconds between batches
+META_TRIES = 5        # attempts per message before giving up and holding it
 
 # ---------------------------------------------------------------------------
 # SUPPLEMENTARY SUBJECT GUARD
@@ -348,6 +354,28 @@ def message_ids(gmail, query: str, cap: int = 50000) -> list[str]:
     return ids
 
 
+def describe(exc) -> str:
+    """Gmail's reason string, not 400 characters of URL.
+
+    The first version logged str(exc) truncated to 160 chars, which cut off before the
+    reason and left "HttpError 403 when requesting https://..." - true, and useless. The
+    reason ('rateLimitExceeded' vs 'notFound' vs 'insufficientPermissions') is the entire
+    diagnostic.
+    """
+    status = getattr(getattr(exc, "resp", None), "status", "?")
+    reason = ""
+    try:
+        body = json.loads(exc.content.decode("utf-8"))
+        err = body.get("error", {})
+        reason = err.get("message", "")
+        details = err.get("errors") or []
+        if details and details[0].get("reason"):
+            reason = f"{details[0]['reason']}: {reason}"
+    except Exception:
+        reason = str(exc)[:120]
+    return f"HTTP {status}  {reason[:160]}"
+
+
 def fetch_metadata(gmail, ids: list[str]) -> tuple[dict[str, dict], list[str], list[str]]:
     """Subject + labelIds for every id. Returns (metadata, still_unread, errors).
 
@@ -369,14 +397,16 @@ def fetch_metadata(gmail, ids: list[str]) -> tuple[dict[str, dict], list[str], l
         if not pending:
             break
         if attempt:
-            time.sleep(min(2 ** attempt, 8))
+            # 1, 2, 4, 8 seconds. A rate limit clears in well under that; anything still
+            # failing after the fourth wait is not transient and gets reported, not hidden.
+            time.sleep(2 ** (attempt - 1))
         failed: list[str] = []
 
         def collect(request_id, response, exception):
             if exception is not None or not response:
                 failed.append(request_id)
                 if exception is not None and len(errors) < 5:
-                    errors.append(str(exception)[:160])
+                    errors.append(describe(exception))
                 return
             hdrs = {h["name"].lower(): h["value"]
                     for h in response.get("payload", {}).get("headers", [])}
@@ -400,8 +430,8 @@ def fetch_metadata(gmail, ids: list[str]) -> tuple[dict[str, dict], list[str], l
             except HttpError as exc:
                 failed.extend(chunk)
                 if len(errors) < 5:
-                    errors.append(str(exc)[:160])
-            time.sleep(0.15)   # stay under the per-user rate limit
+                    errors.append(describe(exc))
+            time.sleep(META_PAUSE)   # stay under the 250 units/second per-user ceiling
 
         pending = failed
 
