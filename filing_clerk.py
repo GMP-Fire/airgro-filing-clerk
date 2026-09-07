@@ -40,7 +40,17 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-FINANCE_ROOT_NAME = "3. Financial Insurance"
+# The finance root is pinned by id, never resolved by title.
+#
+# On 2026-09-07 the folder was renamed "3. Financial Insurance" -> "03. Financial
+# Insurance". The title lookup that stood here found nothing, and within seven
+# seconds a new, empty "3. Financial Insurance" existed at My Drive root with
+# documents filed into it. A title is a label Andrew is free to change; the id is
+# the folder's identity. So there is deliberately no fallback below: if the id
+# does not resolve the run aborts. It must never search by title and must never
+# create a folder - filing into a plausible-looking wrong place is worse than not
+# running at all.
+FINANCE_ROOT_ID = "12EAKPnQEl4KiPED6RjUwT_znkd-VXjPL"
 CLERK_FOLDER_NAME = "_Filing Clerk"
 RULES_NAME = "filing-rules.json"
 FILED_NAME = "filed.jsonl"
@@ -91,6 +101,7 @@ class Drive:
         self.svc = service
         self._folder_cache: dict[tuple[str, str], str] = {}
         self._root_id: str | None = None
+        self._root_title: str | None = None
 
     def _find_child(self, parent_id: str, name: str, folder_only: bool = True) -> str | None:
         key = (parent_id, name)
@@ -109,25 +120,50 @@ class Drive:
         return files[0]["id"]
 
     def finance_root(self) -> str:
+        """Resolve the finance root by id, or abort. Never by title, never created."""
         if self._root_id:
             return self._root_id
-        res = (
-            self.svc.files()
-            .list(
-                q=(
-                    f"name = '{FINANCE_ROOT_NAME}' and trashed = false "
-                    "and mimeType = 'application/vnd.google-apps.folder'"
-                ),
-                fields="files(id,name)",
-                pageSize=5,
-            )
-            .execute()
+
+        abort_tail = (
+            "Nothing was filed. Fix FINANCE_ROOT_ID in filing_clerk.py, or restore the "
+            "folder in Drive, then run again. This run will not fall back to a title "
+            "lookup and will not create a folder."
         )
-        files = res.get("files", [])
-        if not files:
-            sys.exit(f"Cannot find the '{FINANCE_ROOT_NAME}' folder in Drive.")
-        self._root_id = files[0]["id"]
+        try:
+            meta = (
+                self.svc.files()
+                .get(fileId=FINANCE_ROOT_ID, fields="id,name,mimeType,trashed")
+                .execute()
+            )
+        except HttpError as exc:
+            sys.exit(
+                f"ABORTING: cannot resolve the finance root folder id "
+                f"{FINANCE_ROOT_ID} in Drive ({exc}). {abort_tail}"
+            )
+        if meta.get("mimeType") != "application/vnd.google-apps.folder":
+            sys.exit(
+                f"ABORTING: {FINANCE_ROOT_ID} is not a folder "
+                f"(mimeType {meta.get('mimeType')!r}). {abort_tail}"
+            )
+        if meta.get("trashed"):
+            sys.exit(
+                f"ABORTING: the finance root folder {FINANCE_ROOT_ID} "
+                f"({meta.get('name')!r}) is in the Drive trash. {abort_tail}"
+            )
+
+        self._root_id = meta["id"]
+        self._root_title = meta.get("name") or FINANCE_ROOT_ID
+        log(f"Finance root: {self._root_title!r} ({self._root_id})")
         return self._root_id
+
+    def root_label(self) -> str:
+        """The root's live Drive title, for log lines and Todoist exceptions.
+
+        Resolves the root if that has not happened yet, so a message can never
+        quote a title the code merely assumed.
+        """
+        self.finance_root()
+        return self._root_title or FINANCE_ROOT_ID
 
     def resolve_path(self, relative_path: str) -> str | None:
         """Walk 'A/B/C' under the finance root. Returns None if any segment is missing.
@@ -415,7 +451,7 @@ def main() -> int:
 
     clerk_folder = drive.resolve_path(CLERK_FOLDER_NAME)
     if not clerk_folder:
-        sys.exit(f"Cannot find '{FINANCE_ROOT_NAME}/{CLERK_FOLDER_NAME}' in Drive.")
+        sys.exit(f"Cannot find '{drive.root_label()}/{CLERK_FOLDER_NAME}' in Drive.")
 
     rules_id = drive.find_config(clerk_folder, RULES_NAME)
     config = json.loads(drive.read_text(rules_id))
@@ -477,7 +513,7 @@ def main() -> int:
                 (
                     f"Filing Clerk: destination folder missing for {rule.id}",
                     f"filing-rules.json rule '{rule.id}' points at "
-                    f"'{FINANCE_ROOT_NAME}/{rule.dest}', which does not exist in Drive. "
+                    f"'{drive.root_label()}/{rule.dest}', which does not exist in Drive. "
                     "Create the folder, or change the dest in filing-rules.json. "
                     "Nothing was filed for this rule.",
                     f"filing-clerk/missing-folder/{rule.id}",
