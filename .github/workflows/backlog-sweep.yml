@@ -18,6 +18,10 @@ on:
         description: "Cap on how many senders to process. 0 = no limit."
         type: string
         default: "0"
+      max_sweep:
+        description: "Hard cap on messages trashed in this run. 0 = no limit. Use 500 first."
+        type: string
+        default: "0"
 
 permissions:
   contents: read
@@ -50,4 +54,5 @@ jobs:
           SWEEP: ${{ inputs.sweep && '1' || '0' }}
           ONLY_SENDERS: ${{ inputs.only_senders }}
           MAX_SENDERS: ${{ inputs.max_senders || '0' }}
+          MAX_SWEEP: ${{ inputs.max_sweep || '0' }}
         run: python backlog_sweep.py
