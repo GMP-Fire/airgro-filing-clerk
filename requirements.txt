@@ -1,0 +1,7 @@
+# Unpinned deliberately: these are pure-Python and the floor versions below are
+# what the code needs. Pinning exact versions breaks on newer interpreters
+# (Homebrew ships Python 3.14) where the pinned build has no wheel yet.
+google-auth>=2.35
+google-auth-oauthlib>=1.2
+google-api-python-client>=2.149
+requests>=2.32

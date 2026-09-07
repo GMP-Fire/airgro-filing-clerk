@@ -1,0 +1,48 @@
+name: Filing Clerk
+
+# 01:10 UTC = 03:10 SAST, the slot the Cowork task used to hold.
+# GitHub's scheduler can lag a busy hour by several minutes; nothing here cares.
+on:
+  schedule:
+    - cron: "10 1 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be filed without writing anything"
+        type: boolean
+        default: false
+      lookback_days:
+        description: "How far back to search Gmail"
+        type: string
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: filing-clerk
+  cancel-in-progress: false
+
+jobs:
+  file:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: File attachments
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          TODOIST_TOKEN: ${{ secrets.TODOIST_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '30' }}
+        run: python filing_clerk.py

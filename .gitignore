@@ -1,0 +1,8 @@
+# Never commit these — the venv is large and the secrets are keys to your mailbox.
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+token.json
+client_secret*.json
