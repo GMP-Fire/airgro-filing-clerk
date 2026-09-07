@@ -146,6 +146,41 @@ class Drive:
     def find_file(self, parent_id: str, name: str) -> str | None:
         return self._find_child(parent_id, name, folder_only=False)
 
+    def find_config(self, parent_id: str, name: str) -> str:
+        """Find exactly one config file, or abort.
+
+        Drive allows several files with the same name in one folder. On 2026-09-07
+        two filing-rules.json existed at once - one with corrected folder paths, one
+        with the new invoice rules - and this code silently took whichever Drive
+        returned first, so half the config was ignored with nothing in the log to
+        show it. Loading the wrong rule table is worse than not running: it files
+        real documents to stale destinations. So refuse to guess.
+        """
+        safe = name.replace("'", "\\'")
+        res = (
+            self.svc.files()
+            .list(
+                q=f"'{parent_id}' in parents and name = '{safe}' and trashed = false",
+                fields="files(id,name,modifiedTime)",
+                pageSize=10,
+            )
+            .execute()
+        )
+        files = res.get("files", [])
+        if not files:
+            sys.exit(f"Cannot find {name} in the _Filing Clerk folder.")
+        if len(files) > 1:
+            listing = "\n".join(
+                f"  {f['id']}  modified {f.get('modifiedTime')}" for f in files
+            )
+            sys.exit(
+                f"ABORTING: {len(files)} files named {name} in the _Filing Clerk folder.\n"
+                f"{listing}\n"
+                "Exactly one must exist. Trash the stale copies in Drive, keeping the one "
+                "that is actually current, then run again. Nothing was filed."
+            )
+        return files[0]["id"]
+
     def read_text(self, file_id: str) -> str:
         return self.svc.files().get_media(fileId=file_id).execute().decode("utf-8")
 
@@ -212,7 +247,30 @@ def slugify(text: str, limit: int = 60) -> str:
     return text[:limit].strip()
 
 
-def render_name(template: str, *, msg_date: str, subject: str, attachment_name: str) -> str:
+PROVIDERS = {
+    "ampath": "Ampath",
+    "lancet": "Lancet",
+    "pathcare": "PathCare",
+    "histologic": "Histologic",
+}
+
+
+def provider_from_sender(sender: str) -> str:
+    """Name the lab from the sender address, for {provider} in a filename.
+
+    Without this a pathology account files as '2026-08-17 Pathology Account.pdf'
+    and you cannot tell Ampath from Lancet without opening it.
+    """
+    low = sender.lower()
+    for key, label in PROVIDERS.items():
+        if key in low:
+            return label
+    return ""
+
+
+def render_name(
+    template: str, *, msg_date: str, subject: str, attachment_name: str, sender: str = ""
+) -> str:
     date = date_from_subject(subject) or msg_date
     trailing = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", attachment_name)
     ref = re.search(r"#?([A-Z0-9]{3,}-[A-Z0-9-]+)", subject)
@@ -222,7 +280,7 @@ def render_name(template: str, *, msg_date: str, subject: str, attachment_name: 
         "{subject}": slugify(subject),
         "{n}": trailing.group(1) if trailing else "1",
         "{ref}": ref.group(1) if ref else "",
-        "{provider}": "",
+        "{provider}": provider_from_sender(sender),
     }
     out = template
     for token, value in values.items():
@@ -304,9 +362,7 @@ def main() -> int:
     if not clerk_folder:
         sys.exit(f"Cannot find '{FINANCE_ROOT_NAME}/{CLERK_FOLDER_NAME}' in Drive.")
 
-    rules_id = drive.find_file(clerk_folder, RULES_NAME)
-    if not rules_id:
-        sys.exit(f"Cannot find {RULES_NAME}.")
+    rules_id = drive.find_config(clerk_folder, RULES_NAME)
     config = json.loads(drive.read_text(rules_id))
     log(f"Loaded {RULES_NAME} v{config.get('version')} — {len(config['rules'])} rules")
 
@@ -409,7 +465,11 @@ def main() -> int:
                     continue
 
                 target_name = render_name(
-                    rule.name, msg_date=msg_date, subject=subject, attachment_name=filename
+                    rule.name,
+                    msg_date=msg_date,
+                    subject=subject,
+                    attachment_name=filename,
+                    sender=sender,
                 )
                 if drive.name_exists(dest_id, target_name):
                     # Already there from an interactive session — record it so we
