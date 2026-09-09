@@ -76,6 +76,16 @@ RUN_BUDGET_SECONDS = int(os.environ.get("RUN_BUDGET_SECONDS", "900"))
 GMAIL_MAX_RETRIES = int(os.environ.get("GMAIL_MAX_RETRIES", "5"))
 GMAIL_BACKOFF_SECONDS = float(os.environ.get("GMAIL_BACKOFF_SECONDS", "20"))
 
+# The unknown-sender sweep. filing-rules.json has described this since it was
+# written ("Any sender not in rules[] or never_file[] that attaches a PDF ...
+# raises ONE Todoist Inbox item asking where it should go"), but no code ever
+# implemented it, so a document from a sender nobody had pre-declared was simply
+# invisible - an iCare warranty that turns up once every few years, a guarantee,
+# a one-off certificate. It runs LAST and capped, so it can never consume the
+# quota that filing needs.
+UNKNOWN_SWEEP = os.environ.get("UNKNOWN_SWEEP", "1").lower() in ("1", "true", "yes")
+UNKNOWN_SCAN_MAX = int(os.environ.get("UNKNOWN_SCAN_MAX", "25"))
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
@@ -419,6 +429,11 @@ def render_name(
         "{n}": trailing.group(1) if trailing else "1",
         "{ref}": ref_value,
         "{provider}": provider_from_sender(sender),
+        # The sender's own filename, minus the extension. Some documents of record
+        # carry their reference as the filename and nowhere else - an iCare warranty
+        # arrives as M4X3X9G5.pdf with the reference in the subject but in no shape
+        # {ref} recognises, since {ref} wants hyphenated groups.
+        "{attachment}": re.sub(r"\.[A-Za-z0-9]+$", "", attachment_name).strip(),
     }
     out = template
     for token, value in values.items():
@@ -662,6 +677,121 @@ class Ledger:
         except Exception as exc:  # noqa: BLE001
             log(f"Could not park unwritten records: {exc}")
             return None
+
+
+# ------------------------------------------------------------------ unknown mail
+
+
+def sweep_unknown_senders(gmail, rules, never_file, after, facts_cache, ledger):
+    """Report PDFs from senders no rule names. Returns one exception tuple, or None.
+
+    Deliberately reports rather than files: filing-rules.json's own instruction is
+    "Do not guess a destination", and a wrong folder is worse than an inbox item.
+    Each reported attachment is written to the ledger under `unknown_key`, in its
+    own namespace, so it is never nagged about twice AND a rule added later still
+    files it normally - which it would not if this reused `dedupe_key`.
+    """
+    known: list[str] = []
+    for rule in rules:
+        known.extend(rule.senders)
+    known = [k for k in known if k]
+
+    reported = set()
+    for line in ledger.lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("unknown_key"):
+            reported.add(rec["unknown_key"])
+
+    query = f"has:attachment filename:pdf after:{after} -in:chats"
+    try:
+        listing = gmail_call(
+            lambda: gmail.users().messages().list(userId="me", q=query, maxResults=100),
+            "messages.list [unknown sweep]",
+        )
+    except (QuotaExhausted, HttpError) as exc:
+        log(f"[unknown sweep] skipped: {exc}")
+        return None
+
+    candidates = [m for m in listing.get("messages", []) if m["id"] not in facts_cache]
+    log(f"[unknown sweep] {len(candidates)} message(s) no rule looked at")
+
+    found: dict[str, list[str]] = {}
+    fetched = 0
+    for ref in candidates:
+        if fetched >= UNKNOWN_SCAN_MAX:
+            log(f"[unknown sweep] stopped at UNKNOWN_SCAN_MAX={UNKNOWN_SCAN_MAX}")
+            break
+        try:
+            msg = gmail_call(
+                lambda mid=ref["id"]: gmail.users().messages().get(
+                    userId="me", id=mid, format="full"
+                ),
+                f"messages.get [unknown sweep] {ref['id']}",
+            )
+        except QuotaExhausted as exc:
+            log(f"[unknown sweep] {exc}")
+            break
+        fetched += 1
+        facts = message_facts(msg)
+        sender = facts["sender"]
+
+        if not facts["pdfs"]:
+            continue
+        if any(nf and nf in sender for nf in never_file):
+            continue
+        if any(k in sender for k in known):
+            # A rule names this sender; its subject filter simply did not match.
+            continue
+
+        for filename, _ in facts["pdfs"]:
+            key = f"unknown::{ref['id']}::{filename}"
+            if key in reported:
+                continue
+            reported.add(key)
+            found.setdefault(sender, []).append(f"{filename} — {facts['subject']}")
+            ledger.add(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "rule": "",
+                    "unknown_key": key,
+                    "unknown_message_id": ref["id"],
+                    "unknown_filename": filename,
+                    "sender": sender,
+                    "subject": facts["subject"],
+                    "outcome": "unknown_sender",
+                    "source": "github-actions",
+                }
+            )
+
+    if not found:
+        log("[unknown sweep] nothing new")
+        return None
+
+    lines = []
+    for sender, items in sorted(found.items()):
+        lines.append(f"{sender}")
+        for item in items[:4]:
+            lines.append(f"  - {item}")
+        if len(items) > 4:
+            lines.append(f"  - ...and {len(items) - 4} more")
+    body = (
+        "These arrived with a PDF attached from senders no rule in "
+        "filing-rules.json names, so nothing filed them and nothing else would "
+        "have told you they existed:\n\n"
+        + "\n".join(lines)
+        + "\n\nFor each one worth keeping: add a rule to filing-rules.json "
+        "(sender, dest, name) and the next run files it and everything like it. "
+        "Ignore the rest - they will not be raised again."
+    )
+    count = sum(len(v) for v in found.values())
+    return (
+        f"Filing Clerk: {count} document(s) from {len(found)} sender(s) with no rule",
+        body,
+        "filing-clerk/unknown-senders",
+    )
 
 
 # ----------------------------------------------------------------------------- run
@@ -912,6 +1042,19 @@ def main() -> int:
                     "filing-clerk/quota-stop",
                 )
             )
+
+    if UNKNOWN_SWEEP and not quota_note:
+        unknown = sweep_unknown_senders(
+            gmail,
+            [Rule.parse(r) for r in config["rules"]],
+            never_file,
+            after,
+            facts_cache,
+            ledger,
+        )
+        if unknown:
+            exceptions.append(unknown)
+        ledger.flush()
 
     parked = ledger.rescue() if ledger.pending else None
     if parked:
