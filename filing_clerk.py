@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -66,6 +67,14 @@ MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "40"))
 # so the run ends on our terms with the ledger flushed and a line in the log
 # naming the rule it stopped at, instead of vanishing mid-upload.
 RUN_BUDGET_SECONDS = int(os.environ.get("RUN_BUDGET_SECONDS", "900"))
+# Gmail bills messages.get at 5 quota units against a per-minute, per-user cap.
+# The dry run of 2026-09-09 died on it after ~150 gets: the FNB rules share one
+# sender+subject and differ only by attachment filename, so the same 50 messages
+# were fetched once per rule, five times over. A per-run cache and a backoff are
+# what make the run finishable; without them the job dies mid-rule, which is what
+# ended the nightly runs of 8 and 9 September.
+GMAIL_MAX_RETRIES = int(os.environ.get("GMAIL_MAX_RETRIES", "5"))
+GMAIL_BACKOFF_SECONDS = float(os.environ.get("GMAIL_BACKOFF_SECONDS", "20"))
 
 
 def log(msg: str) -> None:
@@ -489,6 +498,95 @@ def raise_todoist(title: str, body: str, key: str, priority: int = 4) -> bool:
     return True
 
 
+# --------------------------------------------------------------------------- gmail
+
+
+class QuotaExhausted(RuntimeError):
+    """Gmail kept refusing on quota after every retry."""
+
+
+RATE_LIMIT_REASONS = {
+    "ratelimitexceeded",
+    "userratelimitexceeded",
+    "quotaexceeded",
+    "backenderror",
+}
+
+
+def _is_rate_limited(exc: HttpError) -> bool:
+    """True only for 'come back later', never for 'you may not do this'.
+
+    Judged on the structured reason Google returns, not on the message text. A
+    403 is the ambiguous one: it covers both the per-minute quota and a scope or
+    permission refusal, and retrying the second for two minutes would hide a real
+    misconfiguration behind a timeout.
+    """
+    if exc.resp.status in (429, 500, 503):
+        return True
+    if exc.resp.status != 403:
+        return False
+    try:
+        payload = json.loads(exc.content.decode("utf-8"))
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        # No parseable body. Fall back to the text, but require the reason token
+        # rather than the human message, which is easier to match by accident.
+        return "rateLimitExceeded" in str(exc) or "userRateLimitExceeded" in str(exc)
+    errors = payload.get("error", {}).get("errors") or []
+    reasons = {str(e.get("reason", "")).lower() for e in errors}
+    status = str(payload.get("error", {}).get("status", "")).lower()
+    if status in ("resource_exhausted", "unavailable"):
+        return True
+    return bool(reasons & RATE_LIMIT_REASONS)
+
+
+def gmail_call(factory, what: str):
+    """Run a Gmail request, waiting out the per-minute quota rather than dying.
+
+    factory() must build a FRESH request each time; an HttpRequest is not
+    reliably re-executable once it has raised.
+    """
+    delay = GMAIL_BACKOFF_SECONDS
+    for attempt in range(1, GMAIL_MAX_RETRIES + 1):
+        try:
+            return factory().execute()
+        except HttpError as exc:
+            if not _is_rate_limited(exc):
+                raise
+            if attempt == GMAIL_MAX_RETRIES:
+                raise QuotaExhausted(
+                    f"Gmail quota still exhausted after {attempt} attempts on {what}"
+                ) from exc
+            log(
+                f"Gmail rate limit on {what}; waiting {delay:.0f}s "
+                f"(attempt {attempt}/{GMAIL_MAX_RETRIES})"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+
+
+def message_facts(msg: dict) -> dict:
+    """Distil a message down to what filing needs.
+
+    Kept small on purpose: the cache holds one of these per message for the whole
+    run, and a full FNB statement message is a couple of hundred KB.
+    """
+    headers = {h["name"].lower(): h["value"] for h in msg["payload"].get("headers", [])}
+    pdfs = []
+    for part in walk_parts(msg["payload"]):
+        filename = part.get("filename") or ""
+        attachment_id = part.get("body", {}).get("attachmentId")
+        if filename and attachment_id and filename.lower().endswith(".pdf"):
+            pdfs.append((filename, attachment_id))
+    return {
+        "sender": headers.get("from", "").lower(),
+        "subject": headers.get("subject", ""),
+        "date": datetime.fromtimestamp(
+            int(msg["internalDate"]) / 1000, tz=timezone.utc
+        ).strftime("%Y-%m-%d"),
+        "pdfs": pdfs,
+    }
+
+
 # -------------------------------------------------------------------------- ledger
 
 
@@ -590,6 +688,8 @@ def main() -> int:
 
     after = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y/%m/%d")
     started = datetime.now(timezone.utc)
+    facts_cache: dict[str, dict] = {}
+    quota_note = ""
     exceptions: list[tuple[str, str, str]] = []
     skipped_outlook: list[str] = []
     filed_count = 0
@@ -605,6 +705,8 @@ def main() -> int:
         if filed_count >= MAX_FILES_PER_RUN:
             log("Hit MAX_FILES_PER_RUN; the rest waits for the next run.")
             break
+        if quota_note:
+            break
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
         if elapsed > RUN_BUDGET_SECONDS:
             log(
@@ -613,13 +715,18 @@ def main() -> int:
             )
             break
 
+        query = rule.gmail_query(after)
         try:
-            listing = (
-                gmail.users()
-                .messages()
-                .list(userId="me", q=rule.gmail_query(after), maxResults=50)
-                .execute()
+            listing = gmail_call(
+                lambda q=query: gmail.users().messages().list(
+                    userId="me", q=q, maxResults=50
+                ),
+                f"messages.list [{rule.id}]",
             )
+        except QuotaExhausted as exc:
+            quota_note = str(exc)
+            log(f"[{rule.id}] {exc}")
+            break
         except HttpError as exc:
             log(f"[{rule.id}] Gmail search failed: {exc}")
             continue
@@ -649,40 +756,43 @@ def main() -> int:
         for ref in messages:
             if filed_count >= MAX_FILES_PER_RUN:
                 break
-            msg = (
-                gmail.users()
-                .messages()
-                .get(userId="me", id=ref["id"], format="full")
-                .execute()
-            )
-            headers = {h["name"].lower(): h["value"] for h in msg["payload"].get("headers", [])}
-            sender = headers.get("from", "").lower()
-            subject = headers.get("subject", "")
+
+            # Several rules share one sender+subject and differ only by attachment
+            # filename (the five FNB accounts). Fetching the same message once per
+            # rule is what exhausted the Gmail quota, so fetch once per run.
+            facts = facts_cache.get(ref["id"])
+            if facts is None:
+                try:
+                    msg = gmail_call(
+                        lambda mid=ref["id"]: gmail.users().messages().get(
+                            userId="me", id=mid, format="full"
+                        ),
+                        f"messages.get {ref['id']}",
+                    )
+                except QuotaExhausted as exc:
+                    quota_note = str(exc)
+                    log(f"[{rule.id}] {exc}")
+                    break
+                facts = message_facts(msg)
+                facts_cache[ref["id"]] = facts
+
+            sender = facts["sender"]
+            subject = facts["subject"]
+            msg_date = facts["date"]
 
             if any(nf and nf in sender for nf in never_file):
                 continue
 
-            msg_date = datetime.fromtimestamp(
-                int(msg["internalDate"]) / 1000, tz=timezone.utc
-            ).strftime("%Y-%m-%d")
-
-            # Collect every PDF in the message FIRST, so sibling attachments that
-            # render to the same name can be told apart before anything uploads.
-            attachments: list[tuple[str, str]] = []
-            for part in walk_parts(msg["payload"]):
-                filename = part.get("filename") or ""
-                attachment_id = part.get("body", {}).get("attachmentId")
-                if not filename or not attachment_id:
-                    continue
-                if not filename.lower().endswith(".pdf"):
-                    continue
-                if rule.attachment_any and not any(
-                    pat.lower() in filename.lower() for pat in rule.attachment_any
-                ):
-                    # This attachment belongs to a different account rule sharing the
-                    # same sender+subject. Leave it for that rule.
-                    continue
-                attachments.append((filename, attachment_id))
+            # Sibling attachments that render to the same name must be told apart
+            # before anything uploads, so take the whole PDF set and then narrow it.
+            attachments = [
+                (filename, attachment_id)
+                for filename, attachment_id in facts["pdfs"]
+                # An attachment_any miss means the PDF belongs to a different
+                # account rule sharing this sender+subject. Leave it for that rule.
+                if not rule.attachment_any
+                or any(pat.lower() in filename.lower() for pat in rule.attachment_any)
+            ]
 
             proposed = {
                 filename: render_name(
@@ -745,12 +855,12 @@ def main() -> int:
                     log(f"[{rule.id}] already in Drive: {target_name}")
                     continue
 
-                attachment = (
-                    gmail.users()
+                attachment = gmail_call(
+                    lambda mid=ref["id"], aid=attachment_id: gmail.users()
                     .messages()
                     .attachments()
-                    .get(userId="me", messageId=ref["id"], id=attachment_id)
-                    .execute()
+                    .get(userId="me", messageId=mid, id=aid),
+                    f"attachments.get {rule.id}",
                 )
                 data = base64.urlsafe_b64decode(attachment["data"])
 
@@ -785,6 +895,24 @@ def main() -> int:
         ledger.flush()
 
     ledger.flush()
+
+    if quota_note:
+        log(f"Stopped early: {quota_note}")
+        if ledger.written == 0 and filed_count == 0:
+            # Made no progress at all, so the next run will not either. Worth one
+            # item. A run that got some of the way just says so in the log.
+            exceptions.append(
+                (
+                    "Filing Clerk: stopped on Gmail quota with nothing filed",
+                    f"{quota_note}\n\nThe run reached no rule before Gmail's "
+                    "per-minute quota refused it, so the backlog is not moving. "
+                    "Check whether something else is sharing the same Google Cloud "
+                    "project's Gmail quota at that hour, or lower the number of "
+                    "rules that hit Gmail in one run.",
+                    "filing-clerk/quota-stop",
+                )
+            )
+
     parked = ledger.rescue() if ledger.pending else None
     if parked:
         exceptions.append(
@@ -807,7 +935,9 @@ def main() -> int:
     log(
         f"Done. Filed {filed_count}, records written {ledger.written}, "
         f"exceptions {len(exceptions)}, "
-        f"elapsed {(datetime.now(timezone.utc) - started).total_seconds():.0f}s."
+        f"messages fetched {len(facts_cache)}, "
+        f"elapsed {(datetime.now(timezone.utc) - started).total_seconds():.0f}s"
+        f"{', stopped early on quota' if quota_note else ''}."
     )
     return 1 if parked else 0
 
