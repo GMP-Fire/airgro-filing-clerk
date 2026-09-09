@@ -62,6 +62,10 @@ DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "30"))
 MAX_EXCEPTIONS = int(os.environ.get("MAX_EXCEPTIONS", "5"))
 MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "40"))
+# The workflow allows 20 minutes. Stop the rule loop before the runner kills it,
+# so the run ends on our terms with the ledger flushed and a line in the log
+# naming the rule it stopped at, instead of vanishing mid-upload.
+RUN_BUDGET_SECONDS = int(os.environ.get("RUN_BUDGET_SECONDS", "900"))
 
 
 def log(msg: str) -> None:
@@ -341,6 +345,11 @@ def attachment_label(filename: str) -> str:
         ("invoice", "Invoice"),
         ("statement", "Statement"),
         ("summary", "Summary"),
+        # MTN names its two PDFs BA<acct>_<timestamp>_INV.pdf and ..._STMT.pdf, so
+        # without these the pair would file as "(1)" and "(2)" and nothing on disk
+        # would say which was the tax invoice.
+        ("_inv", "Tax Invoice"),
+        ("_stmt", "Statement"),
     ):
         if key in low:
             return label
@@ -480,6 +489,83 @@ def raise_todoist(title: str, body: str, key: str, priority: int = 4) -> bool:
     return True
 
 
+# -------------------------------------------------------------------------- ledger
+
+
+class Ledger:
+    """filed.jsonl, flushed as the run goes rather than once at the end.
+
+    Until 2026-09-09 every record was held in memory and written in a single call
+    after the last rule. The nightly runs of 8 and 9 September uploaded five FNB
+    statements to Drive and wrote none of them down, because whatever ended those
+    runs ended them before that one write. A stale ledger is not cosmetic: the
+    Gmail Steward archives a document only once filed.jsonl confirms it was filed,
+    so the statements stayed in the inbox and steward/unfiled/noreply@fnb.co.za
+    stayed open for five consecutive Steward runs. Flushing after every rule caps
+    the loss at the rule in flight.
+    """
+
+    def __init__(self, drive: "Drive", folder_id: str) -> None:
+        self.drive = drive
+        self.folder_id = folder_id
+        self.file_id = drive.find_file(folder_id, FILED_NAME)
+        self.lines = drive.read_text(self.file_id).splitlines() if self.file_id else []
+        self.pending: list[dict] = []
+        self.written = 0
+        self.degraded = False
+        self.keys: set[str] = set()
+        for line in self.lines:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("dedupe_key"):
+                self.keys.add(rec["dedupe_key"])
+            elif rec.get("message_id") and rec.get("filename"):
+                self.keys.add(f"{rec['message_id']}::{rec['filename']}")
+
+    def add(self, record: dict) -> None:
+        self.pending.append(record)
+        if record.get("dedupe_key"):
+            self.keys.add(record["dedupe_key"])
+
+    def flush(self) -> None:
+        if not self.pending or DRY_RUN:
+            return
+        payload = "\n".join(self.lines + [json.dumps(r) for r in self.pending]) + "\n"
+        try:
+            if self.file_id:
+                self.drive.replace_text(self.file_id, payload, mime="application/json")
+            else:
+                self.file_id = self.drive.create_text(
+                    self.folder_id, FILED_NAME, payload, "application/json"
+                )
+            self.lines = payload.splitlines()
+            self.written += len(self.pending)
+            log(f"{FILED_NAME} +{len(self.pending)} records ({len(self.lines)} total)")
+            self.pending = []
+            self.degraded = False
+        except Exception as exc:  # noqa: BLE001 - the run must not die on a log write
+            # Keep the records and try again on the next flush. Nothing is dropped
+            # until rescue() runs, and rescue() only ever creates a new file.
+            self.degraded = True
+            log(f"{FILED_NAME} write failed, holding {len(self.pending)} record(s): {exc}")
+
+    def rescue(self) -> str | None:
+        """Last resort: park unflushed records in a new file. Returns its name."""
+        if not self.pending or DRY_RUN:
+            return None
+        name = f"filed-recovery-{datetime.now(timezone.utc):%Y-%m-%dT%H%M%SZ}.jsonl"
+        body = "\n".join(json.dumps(r) for r in self.pending) + "\n"
+        try:
+            self.drive.create_text(self.folder_id, name, body, "application/json")
+            log(f"Parked {len(self.pending)} unwritten record(s) in {name}")
+            return name
+        except Exception as exc:  # noqa: BLE001
+            log(f"Could not park unwritten records: {exc}")
+            return None
+
+
 # ----------------------------------------------------------------------------- run
 
 
@@ -498,22 +584,12 @@ def main() -> int:
 
     never_file = [s.lower() for s in config.get("never_file", [])]
 
-    filed_id = drive.find_file(clerk_folder, FILED_NAME)
-    filed_lines = drive.read_text(filed_id).splitlines() if filed_id else []
-    already: set[str] = set()
-    for line in filed_lines:
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if rec.get("dedupe_key"):
-            already.add(rec["dedupe_key"])
-        elif rec.get("message_id") and rec.get("filename"):
-            already.add(f"{rec['message_id']}::{rec['filename']}")
-    log(f"{FILED_NAME}: {len(filed_lines)} records, {len(already)} dedupe keys")
+    ledger = Ledger(drive, clerk_folder)
+    already = ledger.keys
+    log(f"{FILED_NAME}: {len(ledger.lines)} records, {len(already)} dedupe keys")
 
     after = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y/%m/%d")
-    new_records: list[dict] = []
+    started = datetime.now(timezone.utc)
     exceptions: list[tuple[str, str, str]] = []
     skipped_outlook: list[str] = []
     filed_count = 0
@@ -528,6 +604,13 @@ def main() -> int:
             continue
         if filed_count >= MAX_FILES_PER_RUN:
             log("Hit MAX_FILES_PER_RUN; the rest waits for the next run.")
+            break
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        if elapsed > RUN_BUDGET_SECONDS:
+            log(
+                f"Run budget reached ({elapsed:.0f}s) at rule '{rule.id}'; "
+                "stopping cleanly. The remaining rules wait for the next run."
+            )
             break
 
         try:
@@ -626,7 +709,7 @@ def main() -> int:
                         # A statement with this number is already filed (perhaps under
                         # a different date prefix). Record it and do not file a second.
                         already.add(dedupe_key)
-                        new_records.append(
+                        ledger.add(
                             {
                                 "ts": datetime.now(timezone.utc).isoformat(),
                                 "rule": rule.id,
@@ -646,7 +729,7 @@ def main() -> int:
                     # Already there from an interactive session — record it so we
                     # stop reconsidering it, but do not upload a second copy.
                     already.add(dedupe_key)
-                    new_records.append(
+                    ledger.add(
                         {
                             "ts": datetime.now(timezone.utc).isoformat(),
                             "rule": rule.id,
@@ -680,7 +763,7 @@ def main() -> int:
                 file_id = drive.upload(dest_id, target_name, data, "application/pdf")
                 filed_count += 1
                 already.add(dedupe_key)
-                new_records.append(
+                ledger.add(
                     {
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "rule": rule.id,
@@ -697,21 +780,36 @@ def main() -> int:
                 )
                 log(f"[{rule.id}] filed {len(data)}B -> {rule.dest}/{target_name}")
 
-    if new_records and not DRY_RUN:
-        payload = "\n".join(filed_lines + [json.dumps(r) for r in new_records]) + "\n"
-        if filed_id:
-            drive.replace_text(filed_id, payload, mime="application/json")
-        else:
-            drive.create_text(clerk_folder, FILED_NAME, payload, "application/json")
-        log(f"{FILED_NAME} updated (+{len(new_records)} records)")
+        # Write the ledger down before moving to the next rule. Everything filed
+        # up to here survives whatever happens after here.
+        ledger.flush()
+
+    ledger.flush()
+    parked = ledger.rescue() if ledger.pending else None
+    if parked:
+        exceptions.append(
+            (
+                "Filing Clerk: could not write filed.jsonl",
+                f"{len(ledger.pending)} record(s) for documents that WERE filed to Drive "
+                f"could not be written to {FILED_NAME}; they are parked in '{parked}' in "
+                "the _Filing Clerk folder. Until they are merged back, the Gmail Steward "
+                "will not archive that mail and will keep reporting it unfiled. Append the "
+                "parked lines to filed.jsonl, then delete the recovery file.",
+                f"filing-clerk/ledger-write-failed/{parked}",
+            )
+        )
 
     for title, body, key in exceptions[:MAX_EXCEPTIONS]:
         raise_todoist(title, body, key, priority=2)
 
     if skipped_outlook:
         log(f"Skipped {len(skipped_outlook)} outlook-only rule(s) by design: {', '.join(skipped_outlook)}")
-    log(f"Done. Filed {filed_count}, records {len(new_records)}, exceptions {len(exceptions)}.")
-    return 0
+    log(
+        f"Done. Filed {filed_count}, records written {ledger.written}, "
+        f"exceptions {len(exceptions)}, "
+        f"elapsed {(datetime.now(timezone.utc) - started).total_seconds():.0f}s."
+    )
+    return 1 if parked else 0
 
 
 def walk_parts(payload: dict):
