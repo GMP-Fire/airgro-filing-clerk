@@ -85,6 +85,11 @@ GMAIL_BACKOFF_SECONDS = float(os.environ.get("GMAIL_BACKOFF_SECONDS", "20"))
 # quota that filing needs.
 UNKNOWN_SWEEP = os.environ.get("UNKNOWN_SWEEP", "1").lower() in ("1", "true", "yes")
 UNKNOWN_SCAN_MAX = int(os.environ.get("UNKNOWN_SCAN_MAX", "25"))
+# Where an unknown document is parked so that ignoring the Todoist item cannot
+# lose it. A holding pen is not a guessed destination: nothing in here is filed,
+# it is waiting to be. Capped so a burst of junk cannot flood Drive.
+UNKNOWN_PARK_DEST = os.environ.get("UNKNOWN_PARK_DEST", "_To review/Unfiled from Gmail")
+UNKNOWN_PARK_MAX = int(os.environ.get("UNKNOWN_PARK_MAX", "10"))
 
 
 def log(msg: str) -> None:
@@ -682,13 +687,16 @@ class Ledger:
 # ------------------------------------------------------------------ unknown mail
 
 
-def sweep_unknown_senders(gmail, rules, never_file, after, facts_cache, ledger):
-    """Report PDFs from senders no rule names. Returns one exception tuple, or None.
+def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, ledger):
+    """Park and report PDFs from senders no rule names. One exception tuple, or None.
 
-    Deliberately reports rather than files: filing-rules.json's own instruction is
-    "Do not guess a destination", and a wrong folder is worse than an inbox item.
-    Each reported attachment is written to the ledger under `unknown_key`, in its
-    own namespace, so it is never nagged about twice AND a rule added later still
+    It parks rather than files: filing-rules.json's instruction is "Do not guess a
+    destination", and UNKNOWN_PARK_DEST is a holding pen, not a guess - nothing in
+    it is filed, it is waiting to be. Parking exists because reporting alone meant
+    an ignored Todoist item left the document in Gmail and nowhere else.
+
+    Each attachment is written to the ledger under `unknown_key`, in its own
+    namespace, so it is never nagged about twice AND a rule added later still
     files it normally - which it would not if this reused `dedupe_key`.
     """
     known: list[str] = []
@@ -704,6 +712,11 @@ def sweep_unknown_senders(gmail, rules, never_file, after, facts_cache, ledger):
             continue
         if rec.get("unknown_key"):
             reported.add(rec["unknown_key"])
+
+    park_id = drive.resolve_path(UNKNOWN_PARK_DEST)
+    if park_id is None:
+        log(f"[unknown sweep] no '{UNKNOWN_PARK_DEST}' folder; reporting only")
+    parked_count = 0
 
     query = f"has:attachment filename:pdf after:{after} -in:chats"
     try:
@@ -746,11 +759,39 @@ def sweep_unknown_senders(gmail, rules, never_file, after, facts_cache, ledger):
             # A rule names this sender; its subject filter simply did not match.
             continue
 
-        for filename, _ in facts["pdfs"]:
+        domain = sender.split("@")[-1].strip("<> ")
+        for filename, attachment_id in facts["pdfs"]:
             key = f"unknown::{ref['id']}::{filename}"
             if key in reported:
                 continue
             reported.add(key)
+
+            parked_as = ""
+            if park_id and not DRY_RUN and parked_count < UNKNOWN_PARK_MAX:
+                parked_as = f"{facts['date']} {domain} - {filename}"
+                try:
+                    if drive.name_exists(park_id, parked_as):
+                        log(f"[unknown sweep] already parked: {parked_as}")
+                    else:
+                        attachment = gmail_call(
+                            lambda mid=ref["id"], aid=attachment_id: gmail.users()
+                            .messages()
+                            .attachments()
+                            .get(userId="me", messageId=mid, id=aid),
+                            "attachments.get [unknown sweep]",
+                        )
+                        data = base64.urlsafe_b64decode(attachment["data"])
+                        drive.upload(park_id, parked_as, data, "application/pdf")
+                        parked_count += 1
+                        log(f"[unknown sweep] parked {len(data)}B -> {UNKNOWN_PARK_DEST}/{parked_as}")
+                except Exception as exc:  # noqa: BLE001
+                    # Parking is a convenience. Never let it cost the report, which
+                    # is the part that actually reaches Andrew.
+                    log(f"[unknown sweep] could not park {filename}: {exc}")
+                    parked_as = ""
+            elif park_id and parked_count >= UNKNOWN_PARK_MAX:
+                log(f"[unknown sweep] UNKNOWN_PARK_MAX={UNKNOWN_PARK_MAX} reached; reporting only")
+
             found.setdefault(sender, []).append(f"{filename} — {facts['subject']}")
             ledger.add(
                 {
@@ -761,6 +802,7 @@ def sweep_unknown_senders(gmail, rules, never_file, after, facts_cache, ledger):
                     "unknown_filename": filename,
                     "sender": sender,
                     "subject": facts["subject"],
+                    "parked_as": parked_as,
                     "outcome": "unknown_sender",
                     "source": "github-actions",
                 }
@@ -777,14 +819,20 @@ def sweep_unknown_senders(gmail, rules, never_file, after, facts_cache, ledger):
             lines.append(f"  - {item}")
         if len(items) > 4:
             lines.append(f"  - ...and {len(items) - 4} more")
+    where = (
+        f"Copies are parked in '{UNKNOWN_PARK_DEST}' so ignoring this item cannot "
+        "lose them. Nothing there is filed - move or delete each one."
+        if park_id and not DRY_RUN
+        else "Nothing was copied to Drive; these exist only in Gmail."
+    )
     body = (
         "These arrived with a PDF attached from senders no rule in "
         "filing-rules.json names, so nothing filed them and nothing else would "
         "have told you they existed:\n\n"
         + "\n".join(lines)
-        + "\n\nFor each one worth keeping: add a rule to filing-rules.json "
-        "(sender, dest, name) and the next run files it and everything like it. "
-        "Ignore the rest - they will not be raised again."
+        + f"\n\n{where}\n\nFor each one worth keeping: add a rule to "
+        "filing-rules.json (sender, dest, name) and the next run files it and "
+        "everything like it. Ignore the rest - they will not be raised again."
     )
     count = sum(len(v) for v in found.values())
     return (
@@ -1046,6 +1094,7 @@ def main() -> int:
     if UNKNOWN_SWEEP and not quota_note:
         unknown = sweep_unknown_senders(
             gmail,
+            drive,
             [Rule.parse(r) for r in config["rules"]],
             never_file,
             after,
