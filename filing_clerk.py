@@ -95,6 +95,11 @@ UNKNOWN_SCAN_MAX = int(os.environ.get("UNKNOWN_SCAN_MAX", "25"))
 # it is waiting to be. Capped so a burst of junk cannot flood Drive.
 UNKNOWN_PARK_KEY = os.environ.get("UNKNOWN_PARK_KEY", "fi.review.unfiled")
 UNKNOWN_PARK_MAX = int(os.environ.get("UNKNOWN_PARK_MAX", "10"))
+# Mail sent to the filing inbox address is ALREADY a document on its way into Drive:
+# Personal Context sweeps it into /_Inbox every 15 minutes and file-doc files it.
+# Parking it here as well put the same document in two holding pens (2026-09-19:
+# a birth certificate, a house layout and a scan, each twice).
+FILE_INBOX_ADDRESS = os.environ.get("FILE_INBOX_ADDRESS", "agwills+file@gmail.com")
 
 
 def log(msg: str) -> None:
@@ -697,7 +702,10 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
         log(f"[unknown sweep] holding pen {drive.label(UNKNOWN_PARK_KEY)} unavailable; reporting only")
     parked_count = 0
 
-    query = f"has:attachment filename:pdf after:{after} -in:chats"
+    query = (
+        f"has:attachment filename:pdf after:{after} -in:chats "
+        f"-to:{FILE_INBOX_ADDRESS} -deliveredto:{FILE_INBOX_ADDRESS}"
+    )
     try:
         listing = gmail_call(
             lambda: gmail.users().messages().list(userId="me", q=query, maxResults=100),
