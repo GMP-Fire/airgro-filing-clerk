@@ -1,0 +1,39 @@
+name: Set Rule Destination
+
+# Manual only. Repoints ONE filing-rules.json rule at another folder-registry key,
+# proving nothing else changed.
+on:
+  workflow_dispatch:
+    inputs:
+      rule_id: { description: "Rule id, e.g. fnb-fusion-private-wealth", type: string, required: true }
+      new_key: { description: "Registry key, e.g. fi.banking.fnb-cheque-2405", type: string, required: true }
+      why: { description: "One line appended to the rule's note", type: string, required: true }
+      apply: { description: "Actually write. Leave OFF to see the change first.", type: boolean, default: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: filing-rules-edit
+  cancel-in-progress: false
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Set destination
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          RULE_ID: ${{ inputs.rule_id }}
+          NEW_KEY: ${{ inputs.new_key }}
+          WHY: ${{ inputs.why }}
+        run: python set_rule_dest.py "$RULE_ID" "$NEW_KEY" "$WHY" ${{ inputs.apply && '--apply' || '' }}
