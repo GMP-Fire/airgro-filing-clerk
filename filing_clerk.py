@@ -98,7 +98,9 @@ UNKNOWN_PARK_MAX = int(os.environ.get("UNKNOWN_PARK_MAX", "10"))
 # Mail sent to the filing inbox address is ALREADY a document on its way into Drive:
 # Personal Context sweeps it into /_Inbox every 15 minutes and file-doc files it.
 # Parking it here as well put the same document in two holding pens (2026-09-19:
-# a birth certificate, a house layout and a scan, each twice).
+# a birth certificate, a house layout and a scan, each twice). Mail Andrew SENDS is
+# excluded for the same reason: its attachments are documents already in Drive,
+# going out (-from:me) - which is what those three actually were.
 FILE_INBOX_ADDRESS = os.environ.get("FILE_INBOX_ADDRESS", "agwills+file@gmail.com")
 
 
@@ -704,7 +706,7 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
 
     query = (
         f"has:attachment filename:pdf after:{after} -in:chats "
-        f"-to:{FILE_INBOX_ADDRESS} -deliveredto:{FILE_INBOX_ADDRESS}"
+        f"-from:me -to:{FILE_INBOX_ADDRESS} -deliveredto:{FILE_INBOX_ADDRESS}"
     )
     try:
         listing = gmail_call(
