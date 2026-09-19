@@ -1,0 +1,32 @@
+name: Build Folder Registry
+
+# Manual only, and meant to run once. The last title walk: captures folder ids into
+# _AI Systems/claude-system/folder-registry.json. Refuses to overwrite an existing one.
+on:
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Create folder-registry.json in Drive. Leave OFF to see it first."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build registry
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: python build_registry.py ${{ inputs.write && '--write' || '' }}
