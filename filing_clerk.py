@@ -41,18 +41,23 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# The finance root is pinned by id, never resolved by title.
+# Every folder is resolved by id, through the folder registry, never by title.
 #
-# On 2026-09-07 the folder was renamed "3. Financial Insurance" -> "03. Financial
+# On 2026-09-07 the finance root was renamed "3. Financial Insurance" -> "03. Financial
 # Insurance". The title lookup that stood here found nothing, and within seven
 # seconds a new, empty "3. Financial Insurance" existed at My Drive root with
-# documents filed into it. A title is a label Andrew is free to change; the id is
-# the folder's identity. So there is deliberately no fallback below: if the id
-# does not resolve the run aborts. It must never search by title and must never
-# create a folder - filing into a plausible-looking wrong place is worse than not
-# running at all.
-FINANCE_ROOT_ID = "12EAKPnQEl4KiPED6RjUwT_znkd-VXjPL"
-CLERK_FOLDER_NAME = "_Filing Clerk"
+# documents filed into it. Pinning the root by id fixed the root; every segment
+# below it still walked titles, so renaming "4. Banking" would have done it again.
+#
+# Now a rule's dest is a KEY in _AI Systems/claude-system/folder-registry.json
+# (built once by build_registry.py), and each key is an id. A title is a label
+# Andrew is free to change. There is deliberately no fallback: if the registry
+# does not resolve the run aborts, and if a key's folder is gone or trashed that
+# rule is skipped with a Todoist item. This code never searches for a folder by
+# title and never creates one.
+REGISTRY_FILE_ID = "1FHG3pTtCbtOfQoucIGOnYq7ugei8bqjU"
+CLERK_KEY = "clerk.config"
+FOLDER_MIME = "application/vnd.google-apps.folder"
 RULES_NAME = "filing-rules.json"
 FILED_NAME = "filed.jsonl"
 
@@ -88,7 +93,7 @@ UNKNOWN_SCAN_MAX = int(os.environ.get("UNKNOWN_SCAN_MAX", "25"))
 # Where an unknown document is parked so that ignoring the Todoist item cannot
 # lose it. A holding pen is not a guessed destination: nothing in here is filed,
 # it is waiting to be. Capped so a burst of junk cannot flood Drive.
-UNKNOWN_PARK_DEST = os.environ.get("UNKNOWN_PARK_DEST", "_To review/Unfiled from Gmail")
+UNKNOWN_PARK_KEY = os.environ.get("UNKNOWN_PARK_KEY", "fi.review.unfiled")
 UNKNOWN_PARK_MAX = int(os.environ.get("UNKNOWN_PARK_MAX", "10"))
 
 
@@ -123,92 +128,66 @@ def credentials() -> Credentials:
 
 
 class Drive:
-    """Thin Drive wrapper with a path cache, so repeated lookups cost nothing."""
+    """Thin Drive wrapper. Folders come from the registry by key; nothing walks titles."""
 
     def __init__(self, service):
         self.svc = service
-        self._folder_cache: dict[tuple[str, str], str] = {}
-        self._root_id: str | None = None
-        self._root_title: str | None = None
+        self.registry: dict[str, dict] = {}
+        self._live: dict[str, dict | None] = {}
 
-    def _find_child(self, parent_id: str, name: str, folder_only: bool = True) -> str | None:
-        key = (parent_id, name)
-        if folder_only and key in self._folder_cache:
-            return self._folder_cache[key]
-        safe = name.replace("'", "\\'")
-        q = f"'{parent_id}' in parents and name = '{safe}' and trashed = false"
-        if folder_only:
-            q += " and mimeType = 'application/vnd.google-apps.folder'"
-        res = self.svc.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
-        files = res.get("files", [])
-        if not files:
-            return None
-        if folder_only:
-            self._folder_cache[key] = files[0]["id"]
-        return files[0]["id"]
-
-    def finance_root(self) -> str:
-        """Resolve the finance root by id, or abort. Never by title, never created."""
-        if self._root_id:
-            return self._root_id
-
-        abort_tail = (
-            "Nothing was filed. Fix FINANCE_ROOT_ID in filing_clerk.py, or restore the "
-            "folder in Drive, then run again. This run will not fall back to a title "
-            "lookup and will not create a folder."
+    def load_registry(self) -> None:
+        """Read folder-registry.json by its pinned id, or abort."""
+        tail = (
+            "Nothing was filed. Restore folder-registry.json in Drive or fix "
+            "REGISTRY_FILE_ID in filing_clerk.py. This run will not fall back to a "
+            "title lookup and will not create a folder."
         )
         try:
-            meta = (
-                self.svc.files()
-                .get(fileId=FINANCE_ROOT_ID, fields="id,name,mimeType,trashed")
-                .execute()
-            )
+            meta = self.svc.files().get(fileId=REGISTRY_FILE_ID, fields="name,trashed").execute()
         except HttpError as exc:
-            sys.exit(
-                f"ABORTING: cannot resolve the finance root folder id "
-                f"{FINANCE_ROOT_ID} in Drive ({exc}). {abort_tail}"
-            )
-        if meta.get("mimeType") != "application/vnd.google-apps.folder":
-            sys.exit(
-                f"ABORTING: {FINANCE_ROOT_ID} is not a folder "
-                f"(mimeType {meta.get('mimeType')!r}). {abort_tail}"
-            )
+            sys.exit(f"ABORTING: cannot read the folder registry {REGISTRY_FILE_ID} ({exc}). {tail}")
         if meta.get("trashed"):
-            sys.exit(
-                f"ABORTING: the finance root folder {FINANCE_ROOT_ID} "
-                f"({meta.get('name')!r}) is in the Drive trash. {abort_tail}"
-            )
+            sys.exit(f"ABORTING: the folder registry {meta.get('name')!r} is in the Drive trash. {tail}")
+        try:
+            self.registry = json.loads(self.read_text(REGISTRY_FILE_ID))["folders"]
+        except (ValueError, KeyError, TypeError) as exc:
+            sys.exit(f"ABORTING: the folder registry is not valid JSON with a 'folders' map ({exc}). {tail}")
+        log(f"Folder registry: {len(self.registry)} keys")
 
-        self._root_id = meta["id"]
-        self._root_title = meta.get("name") or FINANCE_ROOT_ID
-        log(f"Finance root: {self._root_title!r} ({self._root_id})")
-        return self._root_id
+    def folder(self, key: str) -> str | None:
+        """The folder id for a registry key. None if the key is unknown, or its folder
+        is gone, trashed or not a folder - checked once per run with files.get."""
+        if key not in self._live:
+            entry = self.registry.get(key)
+            meta = None
+            if entry:
+                try:
+                    meta = (
+                        self.svc.files()
+                        .get(fileId=entry["id"], fields="id,name,mimeType,trashed")
+                        .execute()
+                    )
+                except HttpError as exc:
+                    log(f"[registry] {key} -> {entry['id']}: {exc}")
+                if meta and (meta.get("trashed") or meta.get("mimeType") != FOLDER_MIME):
+                    log(f"[registry] {key} -> {entry['id']} is trashed or not a folder")
+                    meta = None
+            self._live[key] = meta
+        meta = self._live[key]
+        return meta["id"] if meta else None
 
-    def root_label(self) -> str:
-        """The root's live Drive title, for log lines and Todoist exceptions.
-
-        Resolves the root if that has not happened yet, so a message can never
-        quote a title the code merely assumed.
-        """
-        self.finance_root()
-        return self._root_title or FINANCE_ROOT_ID
-
-    def resolve_path(self, relative_path: str) -> str | None:
-        """Walk 'A/B/C' under the finance root. Returns None if any segment is missing.
-
-        Deliberately does NOT create folders. filing-rules.json says never guess a
-        destination; a missing folder is a question for Andrew, not a decision here.
-        """
-        node = self.finance_root()
-        for segment in [s for s in relative_path.split("/") if s]:
-            child = self._find_child(node, segment)
-            if child is None:
-                return None
-            node = child
-        return node
+    def label(self, key: str) -> str:
+        """'key (live title)' for logs and Todoist - the title as Drive has it now."""
+        meta = self._live.get(key)
+        hint = self.registry.get(key, {}).get("title_hint")
+        return f"{key} ({meta['name'] if meta else hint or 'not in registry'})"
 
     def find_file(self, parent_id: str, name: str) -> str | None:
-        return self._find_child(parent_id, name, folder_only=False)
+        safe = name.replace("'", "\\'")
+        q = f"'{parent_id}' in parents and name = '{safe}' and trashed = false"
+        res = self.svc.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
+        files = res.get("files", [])
+        return files[0]["id"] if files else None
 
     def find_config(self, parent_id: str, name: str) -> str:
         """Find exactly one config file, or abort.
@@ -691,7 +670,7 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
     """Park and report PDFs from senders no rule names. One exception tuple, or None.
 
     It parks rather than files: filing-rules.json's instruction is "Do not guess a
-    destination", and UNKNOWN_PARK_DEST is a holding pen, not a guess - nothing in
+    destination", and UNKNOWN_PARK_KEY is a holding pen, not a guess - nothing in
     it is filed, it is waiting to be. Parking exists because reporting alone meant
     an ignored Todoist item left the document in Gmail and nowhere else.
 
@@ -713,9 +692,9 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
         if rec.get("unknown_key"):
             reported.add(rec["unknown_key"])
 
-    park_id = drive.resolve_path(UNKNOWN_PARK_DEST)
+    park_id = drive.folder(UNKNOWN_PARK_KEY)
     if park_id is None:
-        log(f"[unknown sweep] no '{UNKNOWN_PARK_DEST}' folder; reporting only")
+        log(f"[unknown sweep] holding pen {drive.label(UNKNOWN_PARK_KEY)} unavailable; reporting only")
     parked_count = 0
 
     query = f"has:attachment filename:pdf after:{after} -in:chats"
@@ -783,7 +762,7 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
                         data = base64.urlsafe_b64decode(attachment["data"])
                         drive.upload(park_id, parked_as, data, "application/pdf")
                         parked_count += 1
-                        log(f"[unknown sweep] parked {len(data)}B -> {UNKNOWN_PARK_DEST}/{parked_as}")
+                        log(f"[unknown sweep] parked {len(data)}B -> {drive.label(UNKNOWN_PARK_KEY)}/{parked_as}")
                 except Exception as exc:  # noqa: BLE001
                     # Parking is a convenience. Never let it cost the report, which
                     # is the part that actually reaches Andrew.
@@ -820,7 +799,7 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
         if len(items) > 4:
             lines.append(f"  - ...and {len(items) - 4} more")
     where = (
-        f"Copies are parked in '{UNKNOWN_PARK_DEST}' so ignoring this item cannot "
+        f"Copies are parked in '{drive.label(UNKNOWN_PARK_KEY)}' so ignoring this item cannot "
         "lose them. Nothing there is filed - move or delete each one."
         if park_id and not DRY_RUN
         else "Nothing was copied to Drive; these exist only in Gmail."
@@ -850,13 +829,24 @@ def main() -> int:
     gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
     drive = Drive(build("drive", "v3", credentials=creds, cache_discovery=False))
 
-    clerk_folder = drive.resolve_path(CLERK_FOLDER_NAME)
+    drive.load_registry()
+    clerk_folder = drive.folder(CLERK_KEY)
     if not clerk_folder:
-        sys.exit(f"Cannot find '{drive.root_label()}/{CLERK_FOLDER_NAME}' in Drive.")
+        sys.exit(f"ABORTING: registry key {drive.label(CLERK_KEY)} does not resolve to a live folder.")
 
     rules_id = drive.find_config(clerk_folder, RULES_NAME)
     config = json.loads(drive.read_text(rules_id))
     log(f"Loaded {RULES_NAME} v{config.get('version')} — {len(config['rules'])} rules")
+
+    # Every dest must be a registry key BEFORE anything runs. A path-shaped dest means
+    # the rules predate the registry; filing half of them is worse than filing none.
+    unregistered = sorted({r["dest"] for r in config["rules"]} - drive.registry.keys())
+    if unregistered:
+        sys.exit(
+            "ABORTING: these filing-rules.json dest values are not folder-registry keys:\n  "
+            + "\n  ".join(unregistered)
+            + "\nAdd the folder to folder-registry.json, or fix the dest. Nothing was filed."
+        )
 
     never_file = [s.lower() for s in config.get("never_file", [])]
 
@@ -914,14 +904,15 @@ def main() -> int:
             continue
         log(f"[{rule.id}] {len(messages)} candidate message(s)")
 
-        dest_id = drive.resolve_path(rule.dest)
+        dest_id = drive.folder(rule.dest)
         if dest_id is None:
             exceptions.append(
                 (
                     f"Filing Clerk: destination folder missing for {rule.id}",
-                    f"filing-rules.json rule '{rule.id}' points at "
-                    f"'{drive.root_label()}/{rule.dest}', which does not exist in Drive. "
-                    "Create the folder, or change the dest in filing-rules.json. "
+                    f"filing-rules.json rule '{rule.id}' points at registry key "
+                    f"{drive.label(rule.dest)}, whose folder is missing or in the Drive "
+                    "trash. Restore the folder, or point the key at the right folder id "
+                    "in folder-registry.json. "
                     "Nothing was filed for this rule.",
                     f"filing-clerk/missing-folder/{rule.id}",
                 )

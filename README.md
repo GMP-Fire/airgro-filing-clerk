@@ -10,7 +10,7 @@ Here the bytes go **Gmail API → this process → Drive API** as a resumable up
 
 ## What it does
 
-- Reads `filing-rules.json` from Drive (the `_Filing Clerk` folder under the finance root) on every run. **That file stays the source of truth** — add a sender or change a destination there and this code does not change.
+- Reads `filing-rules.json` from Drive (the `_Filing Clerk` folder, registry key `clerk.config`) on every run. **That file stays the source of truth** — add a sender or change a destination there and this code does not change.
 - Searches Gmail for each rule, downloads matching PDF attachments, and uploads them into the destination folder under the naming template in the rule.
 - Appends a record per document to `filed.jsonl` in the same folder. The Gmail Steward reads that file to decide when a thread is safe to archive, so this keeps working exactly as it does now.
 - Raises a Todoist Inbox item (label `agent`, with a `key:` line) when a destination folder is missing. Nothing else. No digests, no email.
@@ -18,7 +18,7 @@ Here the bytes go **Gmail API → this process → Drive API** as a resumable up
 ## What it deliberately does not do
 
 - **Never creates folders.** A missing destination is a question for you, not a guess. It raises an item and skips that rule.
-- **Never resolves the finance root by name.** The root is pinned to the folder id `12EAKPnQEl4KiPED6RjUwT_znkd-VXjPL` (`FINANCE_ROOT_ID` in `filing_clerk.py`). If that id does not resolve — trashed, deleted, or no longer visible to the credentials — the run aborts and files nothing. There is no title fallback.
+- **Never resolves a folder by name.** Every destination in `filing-rules.json` is a KEY (`fi.banking.fnb-gold-business-account`) in `_AI Systems/claude-system/folder-registry.json`, which maps it to a folder id. The registry itself is pinned by file id (`REGISTRY_FILE_ID` in `filing_clerk.py`). Renaming any folder is safe. If the registry does not resolve the run aborts; if one key's folder is trashed or gone, that rule is skipped with a Todoist item. There is no title fallback. To add a destination, add a key to the registry first. (`build_registry.py` was the one-off walk that captured the ids, 2026-09-19.)
 - **Never opens a password-protected PDF.** Payslips, bank statements and Momentum documents are copied byte for byte, exactly as issued.
 - **Never touches Outlook.** Rules marked `"mailbox": "outlook"` are skipped silently by design — Gmail credentials cannot reach `andrew@airgro.co.za`. Those still need a live session.
 - **Never deletes or archives mail.** That is the Gmail Steward's job.

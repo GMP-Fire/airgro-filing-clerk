@@ -17,8 +17,9 @@ more than 1: a registry built on a guess is worse than no registry. It never
 creates a folder and never overwrites an existing registry.
 
 Usage (GitHub Actions: Build Folder Registry):
-  python build_registry.py            # print the registry, write nothing
-  python build_registry.py --write    # also create folder-registry.json in Drive
+  python build_registry.py                    # print the registry, write nothing
+  python build_registry.py --write            # also create folder-registry.json in Drive
+  python build_registry.py --migrate-rules    # rewrite filing-rules.json dests as keys
 """
 
 from __future__ import annotations
@@ -30,7 +31,10 @@ from datetime import datetime, timezone
 
 from googleapiclient.discovery import build
 
-from filing_clerk import FINANCE_ROOT_ID, credentials, log
+from filing_clerk import credentials, log
+
+# The finance root, pinned by id since 2026-09-07. The one folder this walk starts from.
+FINANCE_ROOT_ID = "12EAKPnQEl4KiPED6RjUwT_znkd-VXjPL"
 
 FOLDER = "application/vnd.google-apps.folder"
 REGISTRY_NAME = "folder-registry.json"
@@ -90,6 +94,67 @@ class Walker:
         return self.svc.files().list(q=q, fields="files(id,name)", pageSize=10).execute().get("files", [])
 
 
+def migrate_rules(svc, w: Walker, clerk: str, rules_id: str, rules: dict) -> int:
+    """filing-rules.json: every dest path -> its registry key, in place (same file id,
+    old content kept in Drive version history). Nothing but dest and the notes changes,
+    and that is PROVEN below, not assumed."""
+    reg_files = w.find_file(REGISTRY_PARENT_ID, REGISTRY_NAME)
+    if len(reg_files) != 1:
+        sys.exit(f"ABORTING: {len(reg_files)} {REGISTRY_NAME} in claude-system.")
+    registry = json.loads(svc.files().get_media(fileId=reg_files[0]["id"]).execute().decode("utf-8"))["folders"]
+
+    if all(r["dest"] in registry for r in rules["rules"]):
+        log("filing-rules.json dests are already registry keys; nothing to do.")
+        return 0
+    new = json.loads(json.dumps(rules))
+    for r in new["rules"]:
+        k = r["dest"] if r["dest"] in registry else key_for(r["dest"])
+        if k not in registry:
+            sys.exit(f"ABORTING: rule {r['id']} dest {r['dest']!r} -> {k!r}, which is not in the registry.")
+        r["dest"] = k
+    prior = rules.get("version")
+    new["version"] = "3.0"
+    new["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    new["note"] = rules["note"].replace(
+        "Destinations are relative to 'My Drive/3. Financial Insurance'.",
+        "Destinations are KEYS in _AI Systems/claude-system/folder-registry.json, which maps "
+        "each key to a folder id - never a path. To add a destination, add a key there first.",
+    )
+    new["path_note"] = (
+        "Since v3.0 (2026-09-19) every dest is a folder-registry key, resolved by id. Renaming "
+        "any folder is safe: the clerk never walks titles and never creates a folder. A key "
+        "whose folder is trashed or gone skips that rule with a Todoist item."
+    )
+    new["v3_0_note"] = (
+        f"2026-09-19: every dest rewritten from a path to its folder-registry key by "
+        f"build_registry.py --migrate-rules. NOTHING ELSE CHANGED from v{prior} - same rules in "
+        "the same order, same never_file[], same folders (by id)."
+    )
+
+    # Proof: strip dest and the notes from both sides; the rest must be identical.
+    def core(d):
+        c = json.loads(json.dumps(d))
+        for key in ("version", "updated", "note", "path_note", "v3_0_note"):
+            c.pop(key, None)
+        for r in c["rules"]:
+            r.pop("dest")
+        return c
+    if core(new) != core(rules):
+        sys.exit("ABORTING: the migration changed something other than dest. Nothing written.")
+    for old, cur in zip(rules["rules"], new["rules"]):
+        print(f"  {old['id']:42} {old['dest']}  ->  {cur['dest']}")
+
+    from googleapiclient.http import MediaInMemoryUpload
+
+    body = json.dumps(new, indent=1, ensure_ascii=False).encode()
+    svc.files().update(fileId=rules_id, media_body=MediaInMemoryUpload(body, mimetype="application/json")).execute()
+    log(f"filing-rules.json v{prior} -> v3.0 written in place ({rules_id}).")
+    return 0
+
+
+REGISTRY_PARENT_ID = "19K2DOo-bUw_ItGAFEAjVTTL-fVHXXpBi"  # sys.claude-system
+
+
 def main() -> int:
     write = "--write" in sys.argv[1:]
     svc = build("drive", "v3", credentials=credentials(), cache_discovery=False)
@@ -107,6 +172,8 @@ def main() -> int:
     if len(rules_files) != 1:
         sys.exit(f"ABORTING: {len(rules_files)} {RULES_NAME} files in {RULES_FOLDER}.")
     rules = json.loads(svc.files().get_media(fileId=rules_files[0]["id"]).execute().decode("utf-8"))
+    if "--migrate-rules" in sys.argv[1:]:
+        return migrate_rules(svc, w, clerk, rules_files[0]["id"], rules)
 
     folders: dict[str, dict] = {"fi.root": {"id": FINANCE_ROOT_ID, "title_hint": root["name"]}}
     wanted: dict[str, tuple[str, str]] = dict(FIXED)

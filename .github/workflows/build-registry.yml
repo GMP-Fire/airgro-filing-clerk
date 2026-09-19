@@ -1,14 +1,16 @@
 name: Build Folder Registry
 
-# Manual only, and meant to run once. The last title walk: captures folder ids into
-# _AI Systems/claude-system/folder-registry.json. Refuses to overwrite an existing one.
+# Manual only. The last title walk: captures folder ids into
+# _AI Systems/claude-system/folder-registry.json (never overwrites one), and the
+# one-shot rewrite of filing-rules.json dests from paths to registry keys.
 on:
   workflow_dispatch:
     inputs:
-      write:
-        description: "Create folder-registry.json in Drive. Leave OFF to see it first."
-        type: boolean
-        default: false
+      mode:
+        description: "preview = print only; write = create the registry; migrate-rules = rewrite rule dests as keys"
+        type: choice
+        options: [preview, write, migrate-rules]
+        default: preview
 
 permissions:
   contents: read
@@ -29,4 +31,10 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-        run: python build_registry.py ${{ inputs.write && '--write' || '' }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          case "$MODE" in
+            write) python build_registry.py --write ;;
+            migrate-rules) python build_registry.py --migrate-rules ;;
+            *) python build_registry.py ;;
+          esac
