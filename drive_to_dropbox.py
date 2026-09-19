@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 
 import requests
 from googleapiclient.discovery import build
@@ -60,6 +61,7 @@ def content_hash(data: bytes) -> str:
 
 def clean(name: str) -> str:
     """A Drive title as a Dropbox path segment: no slash, no trailing space or dot."""
+    name = unicodedata.normalize("NFC", name)  # Dropbox rejects decomposed forms
     return name.replace("/", "-").replace("\\", "-").rstrip(" .") or "_"
 
 
