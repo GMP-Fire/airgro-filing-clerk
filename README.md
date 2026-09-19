@@ -10,7 +10,7 @@ Here the bytes go **Gmail API → this process → Drive API** as a resumable up
 
 ## What it does
 
-- Reads `filing-rules.json` from Drive (the `_Filing Clerk` folder, registry key `clerk.config`) on every run. **That file stays the source of truth** — add a sender or change a destination there and this code does not change.
+- Reads `filing-rules.json` from Drive (`_AI Systems/claude-system/filing-clerk`, registry key `clerk.config`) on every run. **That file stays the source of truth** — add a sender or change a destination there and this code does not change.
 - Searches Gmail for each rule, downloads matching PDF attachments, and uploads them into the destination folder under the naming template in the rule.
 - Appends a record per document to `filed.jsonl` in the same folder. The Gmail Steward reads that file to decide when a thread is safe to archive, so this keeps working exactly as it does now.
 - Raises a Todoist Inbox item (label `agent`, with a `key:` line) when a destination folder is missing. Nothing else. No digests, no email.

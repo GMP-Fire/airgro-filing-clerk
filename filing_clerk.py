@@ -93,7 +93,7 @@ UNKNOWN_SCAN_MAX = int(os.environ.get("UNKNOWN_SCAN_MAX", "25"))
 # Where an unknown document is parked so that ignoring the Todoist item cannot
 # lose it. A holding pen is not a guessed destination: nothing in here is filed,
 # it is waiting to be. Capped so a burst of junk cannot flood Drive.
-UNKNOWN_PARK_KEY = os.environ.get("UNKNOWN_PARK_KEY", "fi.review.unfiled")
+UNKNOWN_PARK_KEY = os.environ.get("UNKNOWN_PARK_KEY", "ops.review")  # _Ops/Review, the one review pen
 UNKNOWN_PARK_MAX = int(os.environ.get("UNKNOWN_PARK_MAX", "10"))
 # Mail sent to the filing inbox address is ALREADY a document on its way into Drive:
 # Personal Context sweeps it into /_Inbox every 15 minutes and file-doc files it.
@@ -218,13 +218,13 @@ class Drive:
         )
         files = res.get("files", [])
         if not files:
-            sys.exit(f"Cannot find {name} in the _Filing Clerk folder.")
+            sys.exit(f"Cannot find {name} in the filing-clerk folder (registry key clerk.config).")
         if len(files) > 1:
             listing = "\n".join(
                 f"  {f['id']}  modified {f.get('modifiedTime')}" for f in files
             )
             sys.exit(
-                f"ABORTING: {len(files)} files named {name} in the _Filing Clerk folder.\n"
+                f"ABORTING: {len(files)} files named {name} in the filing-clerk folder (registry key clerk.config).\n"
                 f"{listing}\n"
                 "Exactly one must exist. Trash the stale copies in Drive, keeping the one "
                 "that is actually current, then run again. Nothing was filed."
@@ -1113,7 +1113,7 @@ def main() -> int:
                 "Filing Clerk: could not write filed.jsonl",
                 f"{len(ledger.pending)} record(s) for documents that WERE filed to Drive "
                 f"could not be written to {FILED_NAME}; they are parked in '{parked}' in "
-                "the _Filing Clerk folder. Until they are merged back, the Gmail Steward "
+                "the filing-clerk folder. Until they are merged back, the Gmail Steward "
                 "will not archive that mail and will keep reporting it unfiled. Append the "
                 "parked lines to filed.jsonl, then delete the recovery file.",
                 f"filing-clerk/ledger-write-failed/{parked}",
