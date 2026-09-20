@@ -1,0 +1,46 @@
+name: Set Rule Fields
+
+# Manual only. Changes ONE filing-rules.json rule's name template and/or dedupe_on,
+# proving nothing else changed. A dest is not reachable from here - that is
+# set-rule-dest.yml's job.
+on:
+  workflow_dispatch:
+    inputs:
+      rule_id: { description: "Rule id, e.g. kehoa-levy", type: string, required: true }
+      name: { description: "New name template (blank = leave alone)", type: string, default: "" }
+      dedupe_on: { description: "New dedupe_on: number, size, or blank to leave alone", type: string, default: "" }
+      why: { description: "One line appended to the rule's note", type: string, required: true }
+      apply: { description: "Actually write. Leave OFF to see the change first.", type: boolean, default: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: filing-rules-edit
+  cancel-in-progress: false
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Set rule fields
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          RULE_ID: ${{ inputs.rule_id }}
+          NEW_NAME: ${{ inputs.name }}
+          NEW_DEDUPE: ${{ inputs.dedupe_on }}
+          WHY: ${{ inputs.why }}
+        run: |
+          python set_rule_fields.py "$RULE_ID" "$WHY" \
+            ${NEW_NAME:+--name "$NEW_NAME"} \
+            ${NEW_DEDUPE:+--dedupe-on "$NEW_DEDUPE"} \
+            ${{ inputs.apply && '--apply' || '' }}

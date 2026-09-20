@@ -420,6 +420,12 @@ def month_from_text(*texts: str) -> str | None:
     return None
 
 
+def next_month(ym: str) -> str:
+    """'2026-08' -> '2026-09'. The whole of the KEHOA fix."""
+    y, m = int(ym[:4]), int(ym[5:7])
+    return f"{y + (1 if m == 12 else 0):04d}-{(m % 12) + 1:02d}"
+
+
 def slugify(text: str, limit: int = 60) -> str:
     text = re.sub(r"[\\/:*?\"<>|]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -515,6 +521,14 @@ def render_name(
         break
     values = {
         "{date}": date,
+        # The month AFTER the email's. KEHOA emails the ADVANCE levy statement on
+        # the 20th-24th for the statement dated the 1st of the next month, so
+        # {yyyy-mm} named every file a month early. Measured 2026-09-20 across 30
+        # emails and the seven already filed by hand: six of the seven are
+        # email month + 1, and both PDFs opened confirm it (the mail of
+        # 2026-08-24 carries a statement DATE: 01/09/2026). Listed BEFORE
+        # {yyyy-mm} so the longer token is consumed first.
+        "{yyyy-mm-next}": next_month(date[:7]),
         "{yyyy-mm}": date[:7],
         "{subject}": slugify(subject),
         "{n}": trailing.group(1) if trailing else "1",
