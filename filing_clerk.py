@@ -88,6 +88,19 @@ GMAIL_BACKOFF_SECONDS = float(os.environ.get("GMAIL_BACKOFF_SECONDS", "20"))
 # invisible - an iCare warranty that turns up once every few years, a guarantee,
 # a one-off certificate. It runs LAST and capped, so it can never consume the
 # quota that filing needs.
+# A backfill names the rules it is for. Empty (the scheduled run) = every rule,
+# which is the behaviour this file has always had. Naming rules does three things
+# a bare lookback_days cannot: it keeps a 2200-day window off the other 27 rules,
+# it keeps the unknown-sender sweep from scanning six years of unrelated mail,
+# and it makes the dry-run table readable.
+ONLY_RULES = [r.strip() for r in os.environ.get("ONLY_RULES", "").split(",") if r.strip()]
+# messages.list returns one page of at most 500. The nightly 30-day window never
+# filled a page, so nothing ever paged; a 2200-day window fills several, and an
+# unpaged list would silently backfill only the newest 50 of 96 MTN mails and
+# report itself complete. Bounded so a typo in only_rules cannot walk the mailbox.
+LIST_PAGE_SIZE = int(os.environ.get("LIST_PAGE_SIZE", "100"))
+LIST_MAX_MESSAGES = int(os.environ.get("LIST_MAX_MESSAGES", "600"))
+
 UNKNOWN_SWEEP = os.environ.get("UNKNOWN_SWEEP", "1").lower() in ("1", "true", "yes")
 UNKNOWN_SCAN_MAX = int(os.environ.get("UNKNOWN_SCAN_MAX", "25"))
 # Where an unknown document is parked so that ignoring the Todoist item cannot
@@ -237,34 +250,35 @@ class Drive:
     def name_exists(self, parent_id: str, name: str) -> bool:
         return self.find_file(parent_id, name) is not None
 
-    def existing_numbers(self, parent_id: str) -> set[str]:
-        """Trailing statement numbers of the PDFs already in a folder.
+    def existing_index(self, parent_id: str) -> "FolderIndex":
+        """Everything already in a destination folder: name -> bytes.
 
-        "... Statement 52.pdf" -> "52". Used to dedupe on statement number so a
-        re-emailed statement under a new date does not land as a second copy.
+        ONE listing answers all three duplicate questions - is this exact name
+        taken, is this exact byte count already here under some other name, and
+        which statement numbers are present - where the code used to make a
+        files.list per rule for numbers plus a files.list per candidate name.
+        A backfill proposes hundreds of names; that is hundreds of round trips
+        saved, and it is what makes size comparison affordable at all.
         """
-        numbers: set[str] = set()
+        by_name: dict[str, int] = {}
         page = None
         while True:
             resp = (
                 self.svc.files()
                 .list(
-                    q=f"'{parent_id}' in parents and trashed=false "
-                    "and mimeType='application/pdf'",
-                    fields="nextPageToken, files(name)",
+                    q=f"'{parent_id}' in parents and trashed=false",
+                    fields="nextPageToken, files(name,size,mimeType)",
                     pageToken=page,
                     pageSize=1000,
                 )
                 .execute()
             )
             for item in resp.get("files", []):
-                m = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", item["name"])
-                if m:
-                    numbers.add(m.group(1))
+                by_name[item["name"]] = int(item.get("size") or 0)
             page = resp.get("nextPageToken")
             if not page:
                 break
-        return numbers
+        return FolderIndex(by_name)
 
     def upload(self, parent_id: str, name: str, data: bytes, mime: str) -> str:
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=True)
@@ -280,6 +294,63 @@ class Drive:
         media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")), mimetype=mime, resumable=True)
         meta = {"name": name, "parents": [parent_id]}
         return self.svc.files().create(body=meta, media_body=media, fields="id").execute()["id"]
+
+
+class FolderIndex:
+    """What a destination folder already holds, asked three ways."""
+
+    def __init__(self, by_name: dict[str, int]) -> None:
+        self.by_name = by_name
+        self.sizes: dict[int, str] = {}
+        self.numbers: set[str] = set()
+        for name, size in by_name.items():
+            if size and size not in self.sizes:
+                self.sizes[size] = name
+            if name.lower().endswith(".pdf"):
+                m = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", name)
+                if m:
+                    self.numbers.add(m.group(1))
+
+    def has_name(self, name: str) -> bool:
+        return name in self.by_name
+
+    def size_of(self, name: str) -> int:
+        return self.by_name.get(name, 0)
+
+    def name_with_size(self, size: int) -> str | None:
+        """The file already here with exactly this byte count, if any.
+
+        Byte-identical is the only duplicate test that survives a rename. The
+        2023-12-06 City of Johannesburg statement was moved into its folder by
+        hand, so no name a rule renders will ever match it; its size will.
+        Opt-in per rule (dedupe_on: "size") because a series whose PDFs are
+        genuinely the same length month to month would false-positive on it.
+        """
+        return self.sizes.get(size) if size else None
+
+    def claim(self, name: str, size: int) -> None:
+        """Record a name this run has taken, so the next message cannot reuse it."""
+        self.by_name[name] = size
+        if size and size not in self.sizes:
+            self.sizes[size] = name
+
+
+def free_name(index: "FolderIndex", name: str) -> str:
+    """The first unused variant of name: 'x.pdf', then 'x (2).pdf', 'x (3).pdf'...
+
+    Two emails in one calendar month render one {yyyy-mm} name. Left alone the
+    second would match the first by name and be recorded as already filed
+    without ever being written - the silent loss disambiguate() already refuses
+    to allow between siblings of ONE message, happening between messages instead.
+    """
+    if not index.has_name(name):
+        return name
+    stem, _, ext = name.rpartition(".")
+    for i in range(2, 100):
+        candidate = f"{stem} ({i}).{ext}" if ext else f"{name} ({i})"
+        if not index.has_name(candidate):
+            return candidate
+    return name
 
 
 # ----------------------------------------------------------------------- rendering
@@ -318,6 +389,41 @@ def date_from_subject(subject: str) -> str | None:
             if full.startswith(name.lower()[:3]):
                 return f"{int(y):04d}-{num:02d}-{int(d):02d}"
     return None
+
+
+DOC_MONTH_RE = re.compile(
+    r"(?:statement|levy|invoice|account)\s+for\s+(?:the\s+month\s+of\s+)?"
+    r"([A-Za-z]{3,9})\s+(\d{4})",
+    re.I,
+)
+
+
+def month_from_text(*texts: str) -> str | None:
+    """The month a document says it is FOR, as YYYY-MM, or None.
+
+    REPORT ONLY. Nothing in the filing path reads this yet. KEHOA emails the
+    ADVANCE levy statement late in the previous month - the one sent 2026-08-24
+    is September's levy - so {yyyy-mm} off the email date names every file a
+    month early. This is the evidence for whether keying on the document's own
+    wording would fix that, measured before anything is renamed.
+    """
+    for text in texts:
+        if not text:
+            continue
+        m = DOC_MONTH_RE.search(text)
+        if not m:
+            continue
+        name, year = m.groups()
+        for full, num in MONTHS.items():
+            if full.startswith(name.lower()[:3]):
+                return f"{int(year):04d}-{num:02d}"
+    return None
+
+
+def next_month(ym: str) -> str:
+    """'2026-08' -> '2026-09'. The whole of the KEHOA fix."""
+    y, m = int(ym[:4]), int(ym[5:7])
+    return f"{y + (1 if m == 12 else 0):04d}-{(m % 12) + 1:02d}"
 
 
 def slugify(text: str, limit: int = 60) -> str:
@@ -415,6 +521,14 @@ def render_name(
         break
     values = {
         "{date}": date,
+        # The month AFTER the email's. KEHOA emails the ADVANCE levy statement on
+        # the 20th-24th for the statement dated the 1st of the next month, so
+        # {yyyy-mm} named every file a month early. Measured 2026-09-20 across 30
+        # emails and the seven already filed by hand: six of the seven are
+        # email month + 1, and both PDFs opened confirm it (the mail of
+        # 2026-08-24 carries a statement DATE: 01/09/2026). Listed BEFORE
+        # {yyyy-mm} so the longer token is consumed first.
+        "{yyyy-mm-next}": next_month(date[:7]),
         "{yyyy-mm}": date[:7],
         "{subject}": slugify(subject),
         "{n}": trailing.group(1) if trailing else "1",
@@ -580,12 +694,19 @@ def message_facts(msg: dict) -> dict:
     pdfs = []
     for part in walk_parts(msg["payload"]):
         filename = part.get("filename") or ""
-        attachment_id = part.get("body", {}).get("attachmentId")
+        body = part.get("body", {})
+        attachment_id = body.get("attachmentId")
         if filename and attachment_id and filename.lower().endswith(".pdf"):
-            pdfs.append((filename, attachment_id))
+            # body.size is the attachment's byte count and it arrives with the
+            # message. Knowing it WITHOUT downloading is what lets a dry run
+            # answer "is this the file already in the folder?" - and what lets a
+            # live run tell a re-send apart from a different document that merely
+            # renders to the same name.
+            pdfs.append((filename, attachment_id, int(body.get("size") or 0)))
     return {
         "sender": headers.get("from", "").lower(),
         "subject": headers.get("subject", ""),
+        "snippet": msg.get("snippet", ""),
         "date": datetime.fromtimestamp(
             int(msg["internalDate"]) / 1000, tz=timezone.utc
         ).strftime("%Y-%m-%d"),
@@ -749,7 +870,7 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
             continue
 
         domain = sender.split("@")[-1].strip("<> ")
-        for filename, attachment_id in facts["pdfs"]:
+        for filename, attachment_id, _size in facts["pdfs"]:
             key = f"unknown::{ref['id']}::{filename}"
             if key in reported:
                 continue
@@ -860,6 +981,25 @@ def main() -> int:
 
     never_file = [s.lower() for s in config.get("never_file", [])]
 
+    selected = config["rules"]
+    if ONLY_RULES:
+        known = {r.get("id") for r in config["rules"]}
+        unknown = [r for r in ONLY_RULES if r not in known]
+        if unknown:
+            # A typo here would file NOTHING and report a clean run, which is the
+            # one outcome a backfill must never be able to produce quietly.
+            sys.exit(
+                "ABORTING: only_rules names rule id(s) that are not in "
+                f"{RULES_NAME}: {', '.join(unknown)}\n"
+                "Nothing was filed. Check the spelling against the rule ids in Drive."
+            )
+        selected = [r for r in config["rules"] if r.get("id") in ONLY_RULES]
+        log(
+            f"only_rules: {len(selected)} of {len(config['rules'])} rules "
+            f"({', '.join(r['id'] for r in selected)}); "
+            f"lookback {LOOKBACK_DAYS} days"
+        )
+
     ledger = Ledger(drive, clerk_folder)
     already = ledger.keys
     log(f"{FILED_NAME}: {len(ledger.lines)} records, {len(already)} dedupe keys")
@@ -872,7 +1012,9 @@ def main() -> int:
     skipped_outlook: list[str] = []
     filed_count = 0
 
-    for raw_rule in config["rules"]:
+    dry_rows: list[dict] = []
+
+    for raw_rule in selected:
         rule = Rule.parse(raw_rule)
 
         if rule.mailbox == "outlook":
@@ -894,13 +1036,24 @@ def main() -> int:
             break
 
         query = rule.gmail_query(after)
+        messages: list[dict] = []
+        page_token = None
+        truncated = False
         try:
-            listing = gmail_call(
-                lambda q=query: gmail.users().messages().list(
-                    userId="me", q=q, maxResults=50
-                ),
-                f"messages.list [{rule.id}]",
-            )
+            while True:
+                listing = gmail_call(
+                    lambda q=query, t=page_token: gmail.users().messages().list(
+                        userId="me", q=q, maxResults=LIST_PAGE_SIZE, pageToken=t
+                    ),
+                    f"messages.list [{rule.id}]",
+                )
+                messages.extend(listing.get("messages", []))
+                page_token = listing.get("nextPageToken")
+                if not page_token:
+                    break
+                if len(messages) >= LIST_MAX_MESSAGES:
+                    truncated = True
+                    break
         except QuotaExhausted as exc:
             quota_note = str(exc)
             log(f"[{rule.id}] {exc}")
@@ -909,9 +1062,14 @@ def main() -> int:
             log(f"[{rule.id}] Gmail search failed: {exc}")
             continue
 
-        messages = listing.get("messages", [])
         if not messages:
             continue
+        if truncated:
+            # Say so rather than let a capped list read as a complete one.
+            log(
+                f"[{rule.id}] LIST_MAX_MESSAGES={LIST_MAX_MESSAGES} reached; "
+                "this rule's window is NOT fully enumerated."
+            )
         log(f"[{rule.id}] {len(messages)} candidate message(s)")
 
         dest_id = drive.folder(rule.dest)
@@ -930,7 +1088,8 @@ def main() -> int:
             log(f"[{rule.id}] destination missing: {rule.dest}")
             continue
 
-        dest_numbers = drive.existing_numbers(dest_id) if rule.dedupe_on == "number" else set()
+        dest_index = drive.existing_index(dest_id)
+        log(f"[{rule.id}] {rule.dest} already holds {len(dest_index.by_name)} file(s)")
 
         for ref in messages:
             if filed_count >= MAX_FILES_PER_RUN:
@@ -965,13 +1124,30 @@ def main() -> int:
             # Sibling attachments that render to the same name must be told apart
             # before anything uploads, so take the whole PDF set and then narrow it.
             attachments = [
-                (filename, attachment_id)
-                for filename, attachment_id in facts["pdfs"]
+                (filename, attachment_id, size)
+                for filename, attachment_id, size in facts["pdfs"]
                 # An attachment_any miss means the PDF belongs to a different
                 # account rule sharing this sender+subject. Leave it for that rule.
                 if not rule.attachment_any
                 or any(pat.lower() in filename.lower() for pat in rule.attachment_any)
             ]
+
+            if not attachments:
+                # The rule's search matched the mail but nothing in it is a PDF
+                # this rule wants. Not an error and not silent either: a backfill
+                # has to be able to account for every message it looked at.
+                if DRY_RUN:
+                    dry_rows.append(
+                        {
+                            "rule": rule.id,
+                            "date": msg_date,
+                            "attachment": "-",
+                            "target": "-",
+                            "action": "skip-no-pdf",
+                            "note": subject[:60],
+                        }
+                    )
+                continue
 
             proposed = {
                 filename: render_name(
@@ -981,20 +1157,46 @@ def main() -> int:
                     attachment_name=filename,
                     sender=sender,
                 )
-                for filename, _ in attachments
+                for filename, _, _ in attachments
             }
             resolved = disambiguate(proposed)
 
-            for filename, attachment_id in attachments:
-                dedupe_key = f"{ref['id']}::{filename}"
-                if dedupe_key in already:
-                    continue
+            # Where {date} came from, and what the document says its own month is.
+            # Both are reporting only - render_name already made the decision.
+            subject_date = date_from_subject(subject)
+            doc_month = month_from_text(subject, facts.get("snippet", ""))
 
+            for filename, attachment_id, att_size in attachments:
+                dedupe_key = f"{ref['id']}::{filename}"
                 target_name = resolved[filename]
+
+                note_bits = []
+                if "{date}" in rule.name:
+                    note_bits.append("date:subject" if subject_date else "date:EMAIL-FALLBACK")
+                if doc_month and doc_month != target_name[:7]:
+                    note_bits.append(f"doc says {doc_month}")
+                note = "; ".join(note_bits)
+
+                def row(action: str, name: str, extra: str = "") -> None:
+                    dry_rows.append(
+                        {
+                            "rule": rule.id,
+                            "date": msg_date,
+                            "attachment": filename,
+                            "target": name,
+                            "action": action,
+                            "note": "; ".join(b for b in (note, extra) if b),
+                        }
+                    )
+
+                if dedupe_key in already:
+                    if DRY_RUN:
+                        row("skip-duplicate", target_name, "already in filed.jsonl")
+                    continue
 
                 if rule.dedupe_on == "number":
                     m = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", filename)
-                    if m and m.group(1) in dest_numbers:
+                    if m and m.group(1) in dest_index.numbers:
                         # A statement with this number is already filed (perhaps under
                         # a different date prefix). Record it and do not file a second.
                         already.add(dedupe_key)
@@ -1012,11 +1214,20 @@ def main() -> int:
                             }
                         )
                         log(f"[{rule.id}] statement #{m.group(1)} already filed, skipping {filename}")
+                        if DRY_RUN:
+                            row("skip-duplicate", target_name, f"statement #{m.group(1)} present")
                         continue
 
-                if drive.name_exists(dest_id, target_name):
-                    # Already there from an interactive session — record it so we
-                    # stop reconsidering it, but do not upload a second copy.
+                # Byte-identical under ANY name. Opt-in (dedupe_on: "size") because
+                # a series whose statements are genuinely the same length every
+                # month would false-positive. It is what catches a file moved into
+                # the folder by hand, whose name no rule will ever reproduce.
+                twin = (
+                    dest_index.name_with_size(att_size)
+                    if "size" in rule.dedupe_on
+                    else None
+                )
+                if twin:
                     already.add(dedupe_key)
                     ledger.add(
                         {
@@ -1025,13 +1236,63 @@ def main() -> int:
                             "message_id": ref["id"],
                             "filename": filename,
                             "dedupe_key": dedupe_key,
-                            "drive_name": target_name,
+                            "drive_name": twin,
                             "dest": rule.dest,
-                            "outcome": "already_present",
+                            "outcome": "already_present_size",
                             "source": "github-actions",
                         }
                     )
-                    log(f"[{rule.id}] already in Drive: {target_name}")
+                    log(f"[{rule.id}] {att_size}B already in Drive as {twin}, skipping {filename}")
+                    if DRY_RUN:
+                        row("skip-duplicate", twin, f"same {att_size}B")
+                    continue
+
+                if dest_index.has_name(target_name):
+                    if dest_index.size_of(target_name) == att_size:
+                        # Same name, same bytes: already there from an interactive
+                        # session. Record it so we stop reconsidering it.
+                        already.add(dedupe_key)
+                        ledger.add(
+                            {
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "rule": rule.id,
+                                "message_id": ref["id"],
+                                "filename": filename,
+                                "dedupe_key": dedupe_key,
+                                "drive_name": target_name,
+                                "dest": rule.dest,
+                                "outcome": "already_present",
+                                "source": "github-actions",
+                            }
+                        )
+                        log(f"[{rule.id}] already in Drive: {target_name}")
+                        if DRY_RUN:
+                            row("skip-duplicate", target_name, "same name and size")
+                        continue
+                    # Same name, DIFFERENT bytes: a different document. Two emails
+                    # in one month render one {yyyy-mm} name, and treating the
+                    # second as already-filed is exactly the silent loss
+                    # disambiguate() refuses to allow between siblings of one
+                    # message. Suffix instead; never overwrite, never drop.
+                    collided = target_name
+                    target_name = free_name(dest_index, target_name)
+                    log(
+                        f"[{rule.id}] name collision: {collided} is "
+                        f"{dest_index.size_of(collided)}B, this is {att_size}B "
+                        f"-> filing as {target_name}"
+                    )
+                    if DRY_RUN:
+                        row("file", target_name, f"collides with {collided}, suffixed")
+                        dest_index.claim(target_name, att_size)
+                        continue
+
+                if DRY_RUN:
+                    # Never download in a dry run. The point of a dry run is the
+                    # decision, and the bytes cost Gmail quota that the live run
+                    # then needs - the quota that ended the runs of 8 and 9 Sept.
+                    row("file", target_name, f"{att_size}B")
+                    dest_index.claim(target_name, att_size)
+                    log(f"[{rule.id}] DRY RUN would file {att_size}B -> {rule.dest}/{target_name}")
                     continue
 
                 attachment = gmail_call(
@@ -1043,15 +1304,14 @@ def main() -> int:
                 )
                 data = base64.urlsafe_b64decode(attachment["data"])
 
-                if DRY_RUN:
-                    log(f"[{rule.id}] DRY RUN would file {len(data)}B -> {rule.dest}/{target_name}")
-                    continue
-
                 # Password-protected PDFs (payslips, bank statements, Momentum) are
                 # filed exactly as issued. Nothing here opens or inspects them.
                 file_id = drive.upload(dest_id, target_name, data, "application/pdf")
                 filed_count += 1
                 already.add(dedupe_key)
+                # The index is this run's memory of the folder. Without this the
+                # next message rendering the same name would not see it.
+                dest_index.claim(target_name, len(data))
                 ledger.add(
                     {
                         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1092,7 +1352,12 @@ def main() -> int:
                 )
             )
 
-    if UNKNOWN_SWEEP and not quota_note:
+    if ONLY_RULES and UNKNOWN_SWEEP:
+        # A targeted backfill has no business scanning six years of unrelated
+        # mail for unknown senders: it would burn the quota the backfill needs
+        # and park a flood of old PDFs in the review pen.
+        log("only_rules is set; skipping the unknown-sender sweep.")
+    if UNKNOWN_SWEEP and not quota_note and not ONLY_RULES:
         unknown = sweep_unknown_senders(
             gmail,
             drive,
@@ -1120,6 +1385,9 @@ def main() -> int:
             )
         )
 
+    if DRY_RUN:
+        print_dry_table(dry_rows)
+
     for title, body, key in exceptions[:MAX_EXCEPTIONS]:
         raise_todoist(title, body, key, priority=2)
 
@@ -1133,6 +1401,84 @@ def main() -> int:
         f"{', stopped early on quota' if quota_note else ''}."
     )
     return 1 if parked else 0
+
+
+def print_dry_table(rows: list[dict]) -> None:
+    """The whole proposal, as one table, before anything is written.
+
+    A dry run whose output is a few hundred interleaved log lines is a dry run
+    nobody reads, and an unread dry run is not a review.
+    """
+    if not rows:
+        print("\nDRY RUN: nothing matched.", flush=True)
+        return
+
+    cols = [
+        ("rule", "rule"),
+        ("date", "email date"),
+        ("attachment", "attachment"),
+        ("target", "target filename"),
+        ("action", "action"),
+        ("note", "note"),
+    ]
+    widths = {
+        key: max(len(head), *(len(str(r.get(key, ""))) for r in rows))
+        for key, head in cols
+    }
+    line = "-+-".join("-" * widths[k] for k, _ in cols)
+
+    print(f"\nDRY RUN — {len(rows)} attachment(s) considered\n", flush=True)
+    print(" | ".join(head.ljust(widths[k]) for k, head in cols), flush=True)
+    print(line, flush=True)
+    for r in sorted(rows, key=lambda r: (r["rule"], r["date"], r["attachment"])):
+        print(
+            " | ".join(str(r.get(k, "")).ljust(widths[k]) for k, _ in cols),
+            flush=True,
+        )
+
+    print("\nCounts per rule:", flush=True)
+    actions = ["file", "skip-duplicate", "skip-no-pdf"]
+    per_rule: dict[str, dict[str, int]] = {}
+    for r in rows:
+        per_rule.setdefault(r["rule"], {}).setdefault(r["action"], 0)
+        per_rule[r["rule"]][r["action"]] += 1
+    head = "rule".ljust(widths["rule"]) + "".join(a.rjust(16) for a in actions)
+    print(head, flush=True)
+    print("-" * len(head), flush=True)
+    totals = {a: 0 for a in actions}
+    for rule_id in sorted(per_rule):
+        counts = per_rule[rule_id]
+        for a in actions:
+            totals[a] += counts.get(a, 0)
+        print(
+            rule_id.ljust(widths["rule"]) + "".join(str(counts.get(a, 0)).rjust(16) for a in actions),
+            flush=True,
+        )
+    print("-" * len(head), flush=True)
+    print(
+        "TOTAL".ljust(widths["rule"]) + "".join(str(totals[a]).rjust(16) for a in actions),
+        flush=True,
+    )
+
+    fallbacks = [r for r in rows if "date:EMAIL-FALLBACK" in r.get("note", "")]
+    if fallbacks:
+        print(
+            f"\n{len(fallbacks)} row(s) fell back to the EMAIL date because the "
+            "subject carried none:",
+            flush=True,
+        )
+        for r in fallbacks:
+            print(f"  [{r['rule']}] {r['date']}  {r['note']}", flush=True)
+
+    mismatches = [r for r in rows if "doc says" in r.get("note", "")]
+    if mismatches:
+        print(
+            f"\n{len(mismatches)} row(s) where the DOCUMENT names a different month "
+            "than the filename (report only, nothing renamed):",
+            flush=True,
+        )
+        for r in sorted(mismatches, key=lambda r: (r["rule"], r["date"])):
+            print(f"  [{r['rule']}] {r['date']}  {r['target']}  <-  {r['note']}", flush=True)
 
 
 def walk_parts(payload: dict):
