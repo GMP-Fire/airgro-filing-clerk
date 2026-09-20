@@ -6,6 +6,8 @@ Input: data-ops.csv, columns op,target,parent,name
   mkdir  target=@label (a name for the new folder, used later in this file)
          parent=<folder id or @label>   name=<folder name>
   move   target=<file/folder id>        parent=<folder id or @label>   name=<optional new name>
+  empty  target=<folder id>              — trash every child of that folder, the folder itself kept
+  trash  target=<file/folder id>         — trash it; a FOLDER is refused unless it is empty
 
 @labels are bound as the run goes, so a file can be moved into a folder this same
 plan creates. Everything is addressed by id: no title walk, no path, no folder
@@ -42,6 +44,48 @@ def main() -> int:
 
     for op in ops:
         kind, target, parent_ref, name = op["op"], op["target"], op["parent"], op.get("name", "")
+
+        if kind in ("empty", "trash"):
+            try:
+                f = svc.files().get(fileId=target, fields="id,name,mimeType,trashed").execute()
+            except HttpError as exc:
+                log(f"FAIL {kind} {target}: {exc}")
+                failed += 1
+                continue
+            if f.get("trashed"):
+                log(f"skip {kind} {f['name']}: already in the trash")
+                continue
+            children = []
+            if f["mimeType"] == FOLDER_MIME:
+                children = svc.files().list(q=f"'{target}' in parents and trashed = false",
+                                            fields="files(id,name)", pageSize=1000).execute().get("files", [])
+            if kind == "trash":
+                if children:
+                    # Trashing a folder takes everything in it with it. A plan that says
+                    # "trash this empty shell" must not quietly bin 40 files.
+                    log(f"REFUSED trash {f['name']}: holds {len(children)} item(s); empty it first")
+                    failed += 1
+                    continue
+                if not apply:
+                    log(f"would trash {f['name']}")
+                    done += 1
+                    continue
+                svc.files().update(fileId=target, body={"trashed": True}).execute()
+                log(f"trashed {f['name']}")
+                done += 1
+                continue
+            for c in children:
+                if not apply:
+                    log(f"would trash {f['name']}/{c['name']}")
+                    done += 1
+                    continue
+                svc.files().update(fileId=c["id"], body={"trashed": True}).execute()
+                log(f"trashed {f['name']}/{c['name']}")
+                done += 1
+            if not children:
+                log(f"{f['name']} is already empty")
+            continue
+
         parent = resolve(parent_ref)
         if parent is None:
             log(f"FAIL {kind} {name or target}: label {parent_ref} was never bound")
