@@ -15,6 +15,14 @@ on:
         description: "How far back to search Gmail"
         type: string
         default: "30"
+      only_rules:
+        description: "Comma-separated rule ids to run (blank = all rules, the nightly behaviour)"
+        type: string
+        default: ""
+      max_files:
+        description: "Upload cap for this run (blank = 40). A backfill needs more."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -26,7 +34,9 @@ concurrency:
 jobs:
   file:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A backfill enumerates years, not 30 days. The schedule never sets
+    # only_rules, so the nightly run keeps its 20 minutes exactly.
+    timeout-minutes: ${{ inputs.only_rules && 60 || 20 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,4 +55,10 @@ jobs:
           TODOIST_TOKEN: ${{ secrets.TODOIST_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           LOOKBACK_DAYS: ${{ inputs.lookback_days || '30' }}
+          ONLY_RULES: ${{ inputs.only_rules }}
+          MAX_FILES_PER_RUN: ${{ inputs.max_files || '40' }}
+          # Must stay inside timeout-minutes above, or the runner kills the job
+          # mid-upload instead of the loop ending on our terms with the ledger
+          # flushed. 55 min of budget under a 60 min timeout; 15 under 20.
+          RUN_BUDGET_SECONDS: ${{ inputs.only_rules && '3300' || '900' }}
         run: python filing_clerk.py
