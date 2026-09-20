@@ -9,6 +9,7 @@ on:
       rule_id: { description: "Rule id, e.g. kehoa-levy", type: string, required: true }
       name: { description: "New name template (blank = leave alone)", type: string, default: "" }
       dedupe_on: { description: "New dedupe_on: number, size, or blank to leave alone", type: string, default: "" }
+      from_any: { description: "Comma-separated sender list REPLACING the rule's senders (blank = leave alone)", type: string, default: "" }
       why: { description: "One line appended to the rule's note", type: string, required: true }
       apply: { description: "Actually write. Leave OFF to see the change first.", type: boolean, default: false }
 
@@ -38,9 +39,11 @@ jobs:
           RULE_ID: ${{ inputs.rule_id }}
           NEW_NAME: ${{ inputs.name }}
           NEW_DEDUPE: ${{ inputs.dedupe_on }}
+          NEW_FROM: ${{ inputs.from_any }}
           WHY: ${{ inputs.why }}
         run: |
           python set_rule_fields.py "$RULE_ID" "$WHY" \
             ${NEW_NAME:+--name "$NEW_NAME"} \
             ${NEW_DEDUPE:+--dedupe-on "$NEW_DEDUPE"} \
+            ${NEW_FROM:+--from-any "$NEW_FROM"} \
             ${{ inputs.apply && '--apply' || '' }}
