@@ -10,6 +10,7 @@ there.
 
   python set_rule_fields.py RULE_ID "why" --name "{yyyy-mm-next} X.pdf"
   python set_rule_fields.py RULE_ID "why" --dedupe-on size
+  python set_rule_fields.py RULE_ID "why" --dedupe-on none   # clears it
   python set_rule_fields.py RULE_ID "why" --from-any "a@x.co.za,b@y.co.za"
   python set_rule_fields.py RULE_ID "why" --name "..." --dedupe-on size --apply
 
@@ -44,6 +45,11 @@ def main() -> int:
     args = ap.parse_args()
     if args.name is None and args.dedupe_on is None and args.from_any is None:
         sys.exit("Nothing to do: pass --name, --dedupe-on and/or --from-any.")
+    # "none" clears the field. An empty string cannot mean "clear" because the
+    # workflow drops a blank input, which has to mean "leave this one alone" -
+    # so a sentinel is the only way to express removal at all.
+    if args.dedupe_on is not None and args.dedupe_on.strip().lower() in ("none", "-"):
+        args.dedupe_on = ""
     senders = [s.strip() for s in (args.from_any or "").split(",") if s.strip()]
     if args.from_any is not None and not senders:
         sys.exit("--from-any was given but parsed to an empty sender list; refusing.")
