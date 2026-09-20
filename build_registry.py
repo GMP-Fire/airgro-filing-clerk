@@ -12,6 +12,12 @@ same thing one level down. After this runs, every consumer resolves a stable KEY
 ("fi.banking.fnb-gold-business-account") to an id, and a title becomes a label
 Andrew is free to change.
 
+SPENT: it ran on 2026-09-19 and the registry exists, so it refuses to overwrite one.
+The paths below describe Drive AS IT WAS THAT DAY — _Filing Clerk has since moved to
+_AI Systems/claude-system/filing-clerk and _To review became _Ops/Review — so this
+would abort if re-run. Edit the registry with registry_edit.py instead; the only
+reason to run this again is building a registry from nothing.
+
 This is the last title walk. It aborts if any path resolves to 0 folders or to
 more than 1: a registry built on a guess is worse than no registry. It never
 creates a folder and never overwrites an existing registry.
