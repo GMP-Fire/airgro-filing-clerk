@@ -113,7 +113,20 @@ already exists in the destination, whatever its date prefix — so the same stat
 re-emailed on a later date cannot land as a second copy. Without it, `{date}` falls
 back to the email date, so a re-send produces a new name and a duplicate slips through.
 
-`dest` is relative to the finance root, which is pinned by folder id, so renaming the root itself is safe. **Every folder below it is still matched by title**, so renaming or renumbering a destination folder in Drive without editing `dest` here breaks that rule — the clerk raises a Todoist item and files nothing for it. Name tokens: `{date}` (from the subject line if it carries one, otherwise the email date), `{yyyy-mm}`, `{subject}`, `{n}` (trailing number on the attachment filename — this is what keeps five same-minute FNB statements distinct), `{ref}`, `{provider}`.
+`dest` is relative to the finance root, which is pinned by folder id, so renaming the root itself is safe. **Every folder below it is still matched by title**, so renaming or renumbering a destination folder in Drive without editing `dest` here breaks that rule — the clerk raises a Todoist item and files nothing for it. Name tokens: `{date}` (from the subject line if it carries one, otherwise the email date), `{yyyy-mm}`, `{subject}`, `{n}` (trailing number on the attachment filename — this is what keeps five same-minute FNB statements distinct), `{ref}`, `{provider}`, `{attachment}`, and `{yyyy-mm-next}` — the month AFTER the
+email's, for a sender that bills in advance (KEHOA emails on the 20th-24th the
+statement dated the 1st of the next month).
+
+`dedupe_on: "size"` skips an attachment whose exact byte count is already in the
+destination under ANY name. It is the only duplicate test that survives a rename, so
+it is what catches a statement filed by hand. Opt-in, because a series whose PDFs are
+genuinely the same length every month would false-positive on it.
+
+Independently of `dedupe_on`, a target name that already exists is compared against
+the attachment's byte count: same bytes is a duplicate and is skipped, different bytes
+is a different document and gets `" (2)"`. Two emails in one calendar month render one
+`{yyyy-mm}` name, and without this the second was recorded as filed without ever being
+written.
 
 ## Knobs
 
@@ -124,7 +137,34 @@ Set as workflow inputs on a manual run, or as `env` in the workflow file:
 | `LOOKBACK_DAYS` | 30 | How far back to search. Raise it for a one-off backfill. |
 | `MAX_FILES_PER_RUN` | 40 | Stops a runaway first run. |
 | `MAX_EXCEPTIONS` | 5 | Cap on Todoist items per run. |
-| `DRY_RUN` | off | Report only, write nothing. |
+| `DRY_RUN` | off | Report only, write nothing. Prints ONE table — rule, email date, attachment, target filename, action — plus counts per rule. It downloads nothing; byte sizes come from the message metadata, so a dry run costs almost no Gmail quota. |
+| `ONLY_RULES` | empty | Comma-separated rule ids. Empty = every rule, which is what the schedule does. Naming rules also switches the unknown-sender sweep off, so a 2200-day backfill cannot scan six years of unrelated mail. An id that is not in `filing-rules.json` ABORTS — a typo would otherwise file nothing and report a clean run. |
+| `LIST_PAGE_SIZE` / `LIST_MAX_MESSAGES` | 100 / 600 | Gmail listing is paged. A capped list says so in the log rather than reading as a complete one. |
+
+### Backfilling one series
+
+Actions → **Filing Clerk** → **Run workflow**, tick **dry_run**, set
+**lookback_days** to cover the history and **only_rules** to the rule ids. Read the
+table. Then run it again without dry_run, raising **max_files** above the number the
+table says it will file — the default 40 exists to stop a runaway first run, not to
+bound a deliberate backfill.
+
+The backfill of 2026-09-20 filed 170 statements across four series (MTN, Country Club,
+City of Johannesburg, KEHOA) with no duplicates and no exceptions.
+
+## Changing a rule without retyping the file
+
+`filing-rules.json` is 20 KB and four automations read it. Retyping it through a chat
+window is how a stray comma destroys it, so narrow edits go through a script that
+expresses the change as data and PROVES the blast radius — everything outside the
+fields being changed must be byte-identical or nothing is written.
+
+| Workflow | Changes |
+| --- | --- |
+| **Set Rule Destination** | one rule's `dest` |
+| **Set Rule Fields** | one rule's `name`, `dedupe_on` and/or sender list |
+
+Both are report-only until you tick **apply**.
 
 ## Backlog Sweep
 
