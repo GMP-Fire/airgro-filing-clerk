@@ -1,0 +1,41 @@
+name: Edit Folder Registry
+
+# Manual only. Applies data-folder-renames.csv BY FOLDER ID. A rename changes a title
+# only; ids never change, so nothing resolving through folder-registry.json is affected.
+on:
+  workflow_dispatch:
+    inputs:
+      args:
+        description: 'e.g. --drop fi.banking.fnb-fusion-private-wealth --refresh-hints'
+        type: string
+        required: true
+      apply:
+        description: "Actually write. Leave OFF to see the change first."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: registry-edit
+  cancel-in-progress: false
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Apply
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          ARGS: ${{ inputs.args }}
+        run: python registry_edit.py $ARGS ${{ inputs.apply && '--apply' || '' }}
