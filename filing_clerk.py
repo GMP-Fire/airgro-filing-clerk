@@ -20,6 +20,7 @@ adds a sender without touching this code. Exceptions go to Todoist, never email.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -261,13 +262,14 @@ class Drive:
         saved, and it is what makes size comparison affordable at all.
         """
         by_name: dict[str, int] = {}
+        by_md5: dict[str, str] = {}
         page = None
         while True:
             resp = (
                 self.svc.files()
                 .list(
                     q=f"'{parent_id}' in parents and trashed=false",
-                    fields="nextPageToken, files(name,size,mimeType)",
+                    fields="nextPageToken, files(name,size,mimeType,md5Checksum)",
                     pageToken=page,
                     pageSize=1000,
                 )
@@ -275,10 +277,12 @@ class Drive:
             )
             for item in resp.get("files", []):
                 by_name[item["name"]] = int(item.get("size") or 0)
+                if item.get("md5Checksum"):
+                    by_md5.setdefault(item["md5Checksum"], item["name"])
             page = resp.get("nextPageToken")
             if not page:
                 break
-        return FolderIndex(by_name)
+        return FolderIndex(by_name, by_md5)
 
     def upload(self, parent_id: str, name: str, data: bytes, mime: str) -> str:
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=True)
@@ -311,8 +315,10 @@ def month_of(name: str) -> str | None:
 class FolderIndex:
     """What a destination folder already holds, asked three ways."""
 
-    def __init__(self, by_name: dict[str, int]) -> None:
+    def __init__(self, by_name: dict[str, int], by_md5: dict[str, str] | None = None) -> None:
         self.by_name = by_name
+        # Drive's own MD5 for every file in the folder, free with the listing.
+        self.md5s: dict[str, str] = dict(by_md5 or {})
         self.sizes: dict[int, str] = {}
         self.numbers: set[str] = set()
         self.months: dict[str, str] = {}
@@ -332,6 +338,18 @@ class FolderIndex:
 
     def size_of(self, name: str) -> int:
         return self.by_name.get(name, 0)
+
+    def name_with_md5(self, digest: str) -> str | None:
+        """The file already here with exactly these BYTES, if any.
+
+        The only duplicate test that needs no opt-in: two files with one MD5 and
+        one size are the same document, whatever either is called. Size alone
+        cannot say that (a series of same-length statements false-positives, which
+        is why dedupe_on: "size" exists), and a name cannot say it at all once
+        somebody has renamed a file by hand. Costs nothing: Drive returns the
+        checksum with the listing, and the bytes are already downloaded.
+        """
+        return self.md5s.get(digest) if digest else None
 
     def name_with_size(self, size: int) -> str | None:
         """The file already here with exactly this byte count, if any.
@@ -358,9 +376,11 @@ class FolderIndex:
         """
         return self.months.get(month) if month else None
 
-    def claim(self, name: str, size: int) -> None:
+    def claim(self, name: str, size: int, digest: str = "") -> None:
         """Record a name this run has taken, so the next message cannot reuse it."""
         self.by_name[name] = size
+        if digest:
+            self.md5s.setdefault(digest, name)
         if size and size not in self.sizes:
             self.sizes[size] = name
         month = month_of(name)
@@ -1371,6 +1391,34 @@ def main() -> int:
                     f"attachments.get {rule.id}",
                 )
                 data = base64.urlsafe_b64decode(attachment["data"])
+                digest = hashlib.md5(data).hexdigest()
+                sha = hashlib.sha256(data).hexdigest()
+
+                # These exact bytes are already in the folder, under whatever name.
+                # The last check before an upload, and the only one that is never
+                # opt-in: identical bytes are the same document. It is what stops the
+                # `(2)` files - a re-sent statement whose name a rule renders slightly
+                # differently used to land beside its twin.
+                twin_bytes = dest_index.name_with_md5(digest)
+                if twin_bytes:
+                    already.add(dedupe_key)
+                    ledger.add(
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "rule": rule.id,
+                            "message_id": ref["id"],
+                            "filename": filename,
+                            "dedupe_key": dedupe_key,
+                            "drive_name": twin_bytes,
+                            "dest": rule.dest,
+                            "md5": digest,
+                            "sha256": sha,
+                            "outcome": "skipped_duplicate",
+                            "source": "github-actions",
+                        }
+                    )
+                    log(f"[{rule.id}] byte-identical to {twin_bytes}, skipping {filename}")
+                    continue
 
                 # Password-protected PDFs (payslips, bank statements, Momentum) are
                 # filed exactly as issued. Nothing here opens or inspects them.
@@ -1379,7 +1427,7 @@ def main() -> int:
                 already.add(dedupe_key)
                 # The index is this run's memory of the folder. Without this the
                 # next message rendering the same name would not see it.
-                dest_index.claim(target_name, len(data))
+                dest_index.claim(target_name, len(data), digest)
                 ledger.add(
                     {
                         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1391,6 +1439,8 @@ def main() -> int:
                         "drive_name": target_name,
                         "dest": rule.dest,
                         "bytes": len(data),
+                        "md5": digest,
+                        "sha256": sha,
                         "outcome": "filed",
                         "source": "github-actions",
                     }
