@@ -1,0 +1,36 @@
+name: Apply Drive Ops
+
+# Manual only. Applies data-folder-renames.csv BY FOLDER ID. A rename changes a title
+# only; ids never change, so nothing resolving through folder-registry.json is affected.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Actually apply. Leave OFF to see the list first."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apply-ops
+  cancel-in-progress: false
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Apply
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: python apply_ops.py ${{ inputs.apply && '--apply' || '' }}
