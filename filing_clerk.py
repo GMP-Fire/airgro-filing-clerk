@@ -296,6 +296,18 @@ class Drive:
         return self.svc.files().create(body=meta, media_body=media, fields="id").execute()["id"]
 
 
+def month_of(name: str) -> str | None:
+    """'2026-09-04 City of Johannesburg ....pdf' -> '2026-09'. None if it has no date.
+
+    Both name shapes this repo produces start with the date: {date} gives
+    YYYY-MM-DD and {yyyy-mm} gives YYYY-MM, so one match covers them. A name
+    that starts with anything else simply has no month, and month-dedupe then
+    cannot fire on it rather than guessing one.
+    """
+    m = re.match(r"(\d{4}-\d{2})(?:-\d{2})?\b", name)
+    return m.group(1) if m else None
+
+
 class FolderIndex:
     """What a destination folder already holds, asked three ways."""
 
@@ -303,6 +315,7 @@ class FolderIndex:
         self.by_name = by_name
         self.sizes: dict[int, str] = {}
         self.numbers: set[str] = set()
+        self.months: dict[str, str] = {}
         for name, size in by_name.items():
             if size and size not in self.sizes:
                 self.sizes[size] = name
@@ -310,6 +323,9 @@ class FolderIndex:
                 m = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", name)
                 if m:
                     self.numbers.add(m.group(1))
+                month = month_of(name)
+                if month and month not in self.months:
+                    self.months[month] = name
 
     def has_name(self, name: str) -> bool:
         return name in self.by_name
@@ -328,11 +344,28 @@ class FolderIndex:
         """
         return self.sizes.get(size) if size else None
 
+    def name_for_month(self, month: str) -> str | None:
+        """The file already here for this billing month, if any.
+
+        For a monthly bill the MONTH is the identity - it is the only thing two
+        renderings of one statement reliably share. City of Johannesburg emails
+        the same bill from two senders: cojestatements attaches a ~70KB PDF
+        carrying the statement date in the subject, e-Joburg a ~275KB one
+        carrying no date at all. Neither name nor byte count can pair them; the
+        month can. Opt-in (dedupe_on: "month") because it means ONE document per
+        month in this folder, which is wrong for a sender that legitimately
+        issues two (KEHOA did, on 2024-07-23).
+        """
+        return self.months.get(month) if month else None
+
     def claim(self, name: str, size: int) -> None:
         """Record a name this run has taken, so the next message cannot reuse it."""
         self.by_name[name] = size
         if size and size not in self.sizes:
             self.sizes[size] = name
+        month = month_of(name)
+        if month and month not in self.months:
+            self.months[month] = name
 
 
 def free_name(index: "FolderIndex", name: str) -> str:
@@ -1064,6 +1097,16 @@ def main() -> int:
 
         if not messages:
             continue
+        # Gmail lists newest first. Reverse it, for two reasons that both matter
+        # more than the order a page happens to arrive in:
+        #   - MAX_FILES_PER_RUN then bites the NEWEST, not the oldest. Newest-first
+        #     meant a capped run dropped the oldest messages and dropped the same
+        #     ones again next run, because new mail keeps arriving ahead of them.
+        #     The backlog could never drain.
+        #   - dedupe_on "month" gives the month to whichever document is seen
+        #     first, so it must be the EARLIEST - the statement itself, not the
+        #     notification that follows it days later.
+        messages.reverse()
         if truncated:
             # Say so rather than let a capped list read as a complete one.
             log(
@@ -1216,6 +1259,31 @@ def main() -> int:
                         log(f"[{rule.id}] statement #{m.group(1)} already filed, skipping {filename}")
                         if DRY_RUN:
                             row("skip-duplicate", target_name, f"statement #{m.group(1)} present")
+                        continue
+
+                # One document per billing month, whatever it is called or how
+                # big it is. Checked before size because it is the broader test:
+                # a month already filed is a month already filed.
+                if "month" in rule.dedupe_on:
+                    held = dest_index.name_for_month(month_of(target_name))
+                    if held:
+                        already.add(dedupe_key)
+                        ledger.add(
+                            {
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "rule": rule.id,
+                                "message_id": ref["id"],
+                                "filename": filename,
+                                "dedupe_key": dedupe_key,
+                                "drive_name": held,
+                                "dest": rule.dest,
+                                "outcome": "already_present_month",
+                                "source": "github-actions",
+                            }
+                        )
+                        log(f"[{rule.id}] {month_of(target_name)} already filed as {held}, skipping {filename}")
+                        if DRY_RUN:
+                            row("skip-duplicate", held, f"month {month_of(target_name)} already filed")
                         continue
 
                 # Byte-identical under ANY name. Opt-in (dedupe_on: "size") because

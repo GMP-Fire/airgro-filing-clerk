@@ -117,6 +117,21 @@ back to the email date, so a re-send produces a new name and a duplicate slips t
 email's, for a sender that bills in advance (KEHOA emails on the 20th-24th the
 statement dated the 1st of the next month).
 
+`dedupe_on: "month"` skips an attachment whose billing month (the `YYYY-MM` its
+name starts with) is already in the destination. For a monthly bill the month is
+the identity — it is the only thing two renderings of one statement reliably share.
+City of Johannesburg emails the same bill twice: `cojestatements` attaches a ~70 KB
+PDF carrying the statement date in the subject, `e-Joburg` a ~275 KB one carrying no
+date at all, so neither the name nor the byte count can pair them. Opt-in, because it
+means ONE document per month in that folder — wrong for a sender that legitimately
+issues two in a month, as KEHOA did on 2024-07-23.
+
+Messages are processed OLDEST first, which is what makes that deterministic: the
+month goes to the earliest document, the statement itself rather than the
+notification that follows days later. It also means `MAX_FILES_PER_RUN` bites the
+newest rather than the oldest, so a capped run drains the backlog instead of dropping
+the same old messages every night.
+
 `dedupe_on: "size"` skips an attachment whose exact byte count is already in the
 destination under ANY name. It is the only duplicate test that survives a rename, so
 it is what catches a statement filed by hand. Opt-in, because a series whose PDFs are
