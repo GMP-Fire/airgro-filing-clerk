@@ -25,8 +25,12 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -557,7 +561,13 @@ def disambiguate(names: dict[str, str]) -> dict[str, str]:
 
 
 def render_name(
-    template: str, *, msg_date: str, subject: str, attachment_name: str, sender: str = ""
+    template: str,
+    *,
+    msg_date: str,
+    subject: str,
+    attachment_name: str,
+    sender: str = "",
+    groups: dict | None = None,
 ) -> str:
     date = date_from_subject(subject) or msg_date
     trailing = re.search(r"(\d+)(?=\.[A-Za-z0-9]+$)", attachment_name)
@@ -594,6 +604,12 @@ def render_name(
         "{attachment}": re.sub(r"\.[A-Za-z0-9]+$", "", attachment_name).strip(),
     }
     out = template
+    # {g:name} - a named group from the rule's attachment_re, matched against the
+    # attachment filename. For documents whose date and reference live ONLY in the
+    # filename: St Peter's names every statement Statement_<acct>_<YYYY-MM-DD>.zip
+    # and re-sends old ones inside later reply threads, so the email date is wrong.
+    for gname, gval in (groups or {}).items():
+        out = out.replace("{g:" + gname + "}", gval or "")
     for token, value in values.items():
         out = out.replace(token, value)
     out = re.sub(r"\s{2,}", " ", out).replace(" .pdf", ".pdf").strip()
@@ -619,6 +635,15 @@ class Rule:
     # exists in dest, regardless of the date prefix. Stops the same statement being
     # filed twice when it is re-emailed on a later date.
     dedupe_on: str = ""
+    # unzip: the document arrives inside a .zip (St Peter's statements). The zip is
+    # opened with zip_password (literal; {g:name} tokens allowed) and each member
+    # filed on its own - a PDF as-is, an .htm/.html rendered to PDF first. The
+    # .zip itself is never filed.
+    unzip: bool = False
+    zip_password: str = ""
+    # Regex with NAMED groups, matched against the attachment filename. The
+    # groups feed {g:name} in `name` and `zip_password`.
+    attachment_re: str = ""
 
     @classmethod
     def parse(cls, raw: dict) -> "Rule":
@@ -632,7 +657,16 @@ class Rule:
             mailbox=raw.get("mailbox", "gmail"),
             attachment_any=raw.get("attachment_any", []),
             dedupe_on=raw.get("dedupe_on", ""),
+            unzip=bool(raw.get("unzip", False)),
+            zip_password=raw.get("zip_password", ""),
+            attachment_re=raw.get("attachment_re", ""),
         )
+
+    def groups_for(self, filename: str) -> dict:
+        if not self.attachment_re:
+            return {}
+        m = re.search(self.attachment_re, filename)
+        return {k: (v or "") for k, v in m.groupdict().items()} if m else {}
 
     def gmail_query(self, after: str) -> str:
         senders = " OR ".join(f"from:{s}" for s in self.senders)
@@ -745,6 +779,7 @@ def message_facts(msg: dict) -> dict:
     """
     headers = {h["name"].lower(): h["value"] for h in msg["payload"].get("headers", [])}
     pdfs = []
+    zips = []
     for part in walk_parts(msg["payload"]):
         filename = part.get("filename") or ""
         body = part.get("body", {})
@@ -756,6 +791,9 @@ def message_facts(msg: dict) -> dict:
             # live run tell a re-send apart from a different document that merely
             # renders to the same name.
             pdfs.append((filename, attachment_id, int(body.get("size") or 0)))
+        elif filename and attachment_id and filename.lower().endswith(".zip"):
+            # Only rules with unzip: true ever look at these.
+            zips.append((filename, attachment_id, int(body.get("size") or 0)))
     return {
         "sender": headers.get("from", "").lower(),
         "subject": headers.get("subject", ""),
@@ -764,6 +802,7 @@ def message_facts(msg: dict) -> dict:
             int(msg["internalDate"]) / 1000, tz=timezone.utc
         ).strftime("%Y-%m-%d"),
         "pdfs": pdfs,
+        "zips": zips,
     }
 
 
@@ -1008,6 +1047,57 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
 # ----------------------------------------------------------------------------- run
 
 
+def extract_zip(data: bytes, password: str) -> list[tuple[str, bytes]]:
+    """The PDF/HTML members of a (possibly password-protected) zip, in name order.
+
+    Python's zipfile reads legacy ZipCrypto, which is what St Peter's uses. An
+    AES-encrypted zip raises here and becomes one Todoist item, never a bad file.
+    """
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    pwd = password.encode() if password else None
+    out = []
+    for info in sorted(zf.infolist(), key=lambda i: i.filename):
+        if info.is_dir():
+            continue
+        low = info.filename.lower()
+        if low.endswith((".pdf", ".htm", ".html")):
+            out.append((os.path.basename(info.filename), zf.read(info, pwd=pwd)))
+    return out
+
+
+def html_to_pdf(html: bytes) -> bytes | None:
+    """Render an HTML statement to PDF with headless Chrome, or None if no browser.
+
+    Since mid-2025 St Peter's sometimes zips an .htm (absolute-positioned
+    ReportBuilder output) instead of a PDF. ubuntu-latest ships google-chrome.
+    """
+    browser = next(
+        (b for b in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
+         if shutil.which(b)),
+        None,
+    )
+    if not browser:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "doc.htm")
+        dst = os.path.join(tmp, "doc.pdf")
+        with open(src, "wb") as fh:
+            fh.write(html)
+        try:
+            subprocess.run(
+                [browser, "--headless=new", "--no-sandbox", "--disable-gpu",
+                 "--no-first-run", "--disable-background-networking",
+                 "--no-pdf-header-footer", f"--print-to-pdf={dst}", "file://" + src],
+                check=False, timeout=90, capture_output=True,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if os.path.exists(dst) and os.path.getsize(dst) > 0:
+            with open(dst, "rb") as fh:
+                return fh.read()
+    return None
+
+
 def main() -> int:
     creds = credentials()
     gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -1195,11 +1285,125 @@ def main() -> int:
                 or any(pat.lower() in filename.lower() for pat in rule.attachment_any)
             ]
 
+            zipped: list = []
+            if rule.unzip:
+                zipped = [
+                    z
+                    for z in facts.get("zips", [])
+                    if not rule.attachment_any
+                    or any(pat.lower() in z[0].lower() for pat in rule.attachment_any)
+                ]
+                for zname, zid, zsize in zipped:
+                    if filed_count >= MAX_FILES_PER_RUN:
+                        break
+                    dedupe_key = f"{ref['id']}::{zname}"
+                    groups = rule.groups_for(zname)
+                    target_name = render_name(
+                        rule.name,
+                        msg_date=msg_date,
+                        subject=subject,
+                        attachment_name=zname,
+                        sender=sender,
+                        groups=groups,
+                    )
+                    base = {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "rule": rule.id,
+                        "message_id": ref["id"],
+                        "filename": zname,
+                        "dedupe_key": dedupe_key,
+                        "dest": rule.dest,
+                        "source": "github-actions",
+                    }
+                    if dedupe_key in already:
+                        if DRY_RUN:
+                            dry_rows.append({"rule": rule.id, "date": msg_date, "attachment": zname,
+                                             "target": target_name, "action": "skip-duplicate",
+                                             "note": "already in filed.jsonl"})
+                        continue
+                    # The statement's identity is its filename (account + statement
+                    # date). The school re-attaches old statements to reply threads,
+                    # so a name already in the folder IS this statement - no download.
+                    stem = re.sub(r"\.pdf$", "", target_name, flags=re.I)
+                    present = next(
+                        (n for n in (target_name, stem + ".htm") if dest_index.has_name(n)), None
+                    )
+                    if present:
+                        already.add(dedupe_key)
+                        ledger.add({**base, "drive_name": present, "outcome": "already_present"})
+                        if DRY_RUN:
+                            dry_rows.append({"rule": rule.id, "date": msg_date, "attachment": zname,
+                                             "target": present, "action": "skip-duplicate",
+                                             "note": "name present"})
+                        continue
+                    if DRY_RUN:
+                        dry_rows.append({"rule": rule.id, "date": msg_date, "attachment": zname,
+                                         "target": target_name, "action": "file",
+                                         "note": f"unzip {zsize}B"})
+                        dest_index.claim(target_name, 0)
+                        continue
+                    attachment = gmail_call(
+                        lambda mid=ref["id"], aid=zid: gmail.users()
+                        .messages()
+                        .attachments()
+                        .get(userId="me", messageId=mid, id=aid),
+                        f"attachments.get {rule.id}",
+                    )
+                    zdata = base64.urlsafe_b64decode(attachment["data"])
+                    password = rule.zip_password
+                    for gname, gval in groups.items():
+                        password = password.replace("{g:" + gname + "}", gval)
+                    try:
+                        members = extract_zip(zdata, password)
+                    except Exception as exc:  # wrong password, corrupt, AES zip
+                        log(f"[{rule.id}] could not open {zname}: {exc}")
+                        exceptions.append(
+                            (
+                                f"Filing Clerk: could not open {zname}",
+                                f"Rule {rule.id} matched {zname} (message {ref['id']}) but the zip "
+                                f"would not open: {exc}. If the school changed the password, "
+                                "update zip_password in filing-rules.json.",
+                                f"filing-clerk/unzip/{rule.id}",
+                            )
+                        )
+                        continue
+                    if not members:
+                        log(f"[{rule.id}] {zname} holds no PDF or HTML, skipping")
+                        continue
+                    for i, (mname, mdata) in enumerate(members):
+                        name_i = target_name if i == 0 else f"{stem} ({i + 1}).pdf"
+                        mime = "application/pdf"
+                        if not mname.lower().endswith(".pdf"):
+                            rendered = html_to_pdf(mdata)
+                            if rendered:
+                                mdata = rendered
+                            else:
+                                # No browser on the runner: keep the document, as HTML.
+                                name_i = re.sub(r"\.pdf$", ".htm", name_i, flags=re.I)
+                                mime = "text/html"
+                        digest = hashlib.md5(mdata).hexdigest()
+                        sha = hashlib.sha256(mdata).hexdigest()
+                        twin = dest_index.name_with_md5(digest)
+                        if twin:
+                            ledger.add({**base, "drive_name": twin, "md5": digest,
+                                        "outcome": "skipped_duplicate"})
+                            continue
+                        if dest_index.has_name(name_i):
+                            name_i = free_name(dest_index, name_i)
+                        file_id = drive.upload(dest_id, name_i, mdata, mime)
+                        filed_count += 1
+                        dest_index.claim(name_i, len(mdata), digest)
+                        ledger.add({**base, "drive_id": file_id, "drive_name": name_i,
+                                    "bytes": len(mdata), "md5": digest, "sha256": sha,
+                                    "unzipped_member": mname, "outcome": "filed"})
+                        log(f"[{rule.id}] unzipped {mname} -> {rule.dest}/{name_i}")
+                    already.add(dedupe_key)
+
             if not attachments:
                 # The rule's search matched the mail but nothing in it is a PDF
                 # this rule wants. Not an error and not silent either: a backfill
                 # has to be able to account for every message it looked at.
-                if DRY_RUN:
+                if DRY_RUN and not zipped:
                     dry_rows.append(
                         {
                             "rule": rule.id,
