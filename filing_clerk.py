@@ -1047,6 +1047,20 @@ def sweep_unknown_senders(gmail, drive, rules, never_file, after, facts_cache, l
 # ----------------------------------------------------------------------------- run
 
 
+IMAGE_EXTS = (".gif", ".png", ".jpg", ".jpeg")
+
+
+def zip_assets(data: bytes, password: str) -> dict[str, bytes]:
+    """Image members by their path inside the zip, for rendering an .htm member."""
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    pwd = password.encode() if password else None
+    return {
+        i.filename: zf.read(i, pwd=pwd)
+        for i in zf.infolist()
+        if not i.is_dir() and i.filename.lower().endswith(IMAGE_EXTS)
+    }
+
+
 def extract_zip(data: bytes, password: str) -> list[tuple[str, bytes]]:
     """The PDF/HTML members of a (possibly password-protected) zip, in name order.
 
@@ -1065,7 +1079,19 @@ def extract_zip(data: bytes, password: str) -> list[tuple[str, bytes]]:
     return out
 
 
-def html_to_pdf(html: bytes) -> bytes | None:
+# ReportBuilder statements absolutely position every element on a ~794x1123px A4
+# canvas, and each one also carries a stray empty div at top: 803485952px. Chrome
+# prints the page down to that div: ~90s and ~9 MB, or a timeout. Clipping the body
+# to one A4 sheet drops it and keeps everything real. overflow:hidden is NOT enough:
+# on <body> it propagates to the viewport and print still paginates the lot (measured:
+# 8.8 MB). overflow:clip + contain:strict makes body a hard box: 16 KB, 2s, one page.
+A4_CLIP_CSS = (
+    b"<style>@page{size:A4;margin:0}html,body{margin:0;padding:0}"
+    b"body{position:relative;width:794px;height:1122px;overflow:clip;contain:strict}</style>"
+)
+
+
+def html_to_pdf(html: bytes, assets: dict[str, bytes] | None = None) -> bytes | None:
     """Render an HTML statement to PDF with headless Chrome, or None if no browser.
 
     Since mid-2025 St Peter's sometimes zips an .htm (absolute-positioned
@@ -1081,8 +1107,19 @@ def html_to_pdf(html: bytes) -> bytes | None:
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "doc.htm")
         dst = os.path.join(tmp, "doc.pdf")
+        low = html.lower()
+        at = low.find(b"</head>")
+        html = html[:at] + A4_CLIP_CSS + html[at:] if at >= 0 else A4_CLIP_CSS + html
         with open(src, "wb") as fh:
             fh.write(html)
+        # The zip's images (row shading, rules) sit beside the .htm by relative path.
+        for rel, blob in (assets or {}).items():
+            path = os.path.normpath(os.path.join(tmp, rel))
+            if not path.startswith(tmp + os.sep):
+                continue  # a ../ member never escapes the temp dir
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(blob)
         # A fresh profile per render: with the default profile a second Chrome
         # finds the first one's SingletonLock, hands off and exits with no PDF.
         # That cost 5 of 8 renders in the 2026-09-21 backfill, silently.
@@ -1393,7 +1430,12 @@ def main() -> int:
                         name_i = target_name if i == 0 else f"{stem} ({i + 1}).pdf"
                         mime = "application/pdf"
                         if not mname.lower().endswith(".pdf"):
-                            rendered = html_to_pdf(mdata)
+                            try:
+                                assets = zip_assets(zdata, password)
+                            except Exception as exc:
+                                log(f"[{rule.id}] {zname}: images unreadable ({exc}); rendering without them")
+                                assets = {}
+                            rendered = html_to_pdf(mdata, assets)
                             if rendered:
                                 mdata = rendered
                             else:
