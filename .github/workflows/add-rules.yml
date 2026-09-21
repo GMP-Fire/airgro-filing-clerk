@@ -1,0 +1,35 @@
+name: Add Rules
+
+# Manual only. Appends the rules in a rule-additions/*.json file to
+# filing-rules.json, proving no existing rule changed.
+on:
+  workflow_dispatch:
+    inputs:
+      path: { description: "Repo path, e.g. rule-additions/2026-09-21-school-fees.json", type: string, required: true }
+      apply: { description: "Actually write. Leave OFF to see the change first.", type: boolean, default: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: filing-rules-edit
+  cancel-in-progress: false
+
+jobs:
+  add:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Add rules
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          RULE_PATH: ${{ inputs.path }}
+        run: python add_rules.py "$RULE_PATH" ${{ inputs.apply && '--apply' || '' }}

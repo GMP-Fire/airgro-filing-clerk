@@ -1,0 +1,42 @@
+[
+ {
+  "id": "st-peters-hannah",
+  "from": "lnel@stpeters.co.za",
+  "subject_any": ["Statement"],
+  "attachment_any": ["Statement_WIL039"],
+  "unzip": true,
+  "zip_password": "{g:acct}",
+  "attachment_re": "Statement_(?P<acct>WIL\\d+)_(?P<date>\\d{4}-\\d\\d-\\d\\d)",
+  "dest": "fi.school-fees.st-peters-statements",
+  "name": "{g:date} St Peter's Statement WIL039 Hannah.pdf",
+  "note": "Hannah's St Peter's Prep account. Statements arrive as a zip whose password is the account code. Date comes from the attachment name - the school re-attaches old statements to reply threads, so the email date is wrong."
+ },
+ {
+  "id": "st-peters-georgia",
+  "from": "lnel@stpeters.co.za",
+  "subject_any": ["Statement"],
+  "attachment_any": ["Statement_WIL043"],
+  "unzip": true,
+  "zip_password": "{g:acct}",
+  "attachment_re": "Statement_(?P<acct>WIL\\d+)_(?P<date>\\d{4}-\\d\\d-\\d\\d)",
+  "dest": "fi.school-fees.st-peters-statements",
+  "name": "{g:date} St Peter's Statement WIL043 Georgia.pdf",
+  "note": "Georgia's St Peter's Prep account. Same format as st-peters-hannah."
+ },
+ {
+  "id": "st-peters-academic-support",
+  "from": "jessddavies@gmail.com",
+  "subject_any": ["Shamani"],
+  "dest": "fi.school-fees.extra-lessons",
+  "name": "{date} Shamani Pillay Academic Support Invoice - {attachment}.pdf",
+  "note": "Jess forwards Mrs Pillay's monthly invoice; one PDF per child ('Hannah Wills.pdf' / 'Georgie Wills.pdf')."
+ },
+ {
+  "id": "st-peters-vocal-lessons",
+  "from": "hlumelo",
+  "subject_any": ["Invoice"],
+  "dest": "fi.school-fees.extra-lessons",
+  "name": "{date} Hannah Vocal Lessons Invoice {subject}.pdf",
+  "note": "Termly invoices for Hannah's singing lessons (Hlumelo Ledwaba)."
+ }
+]
