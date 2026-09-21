@@ -1083,18 +1083,26 @@ def html_to_pdf(html: bytes) -> bytes | None:
         dst = os.path.join(tmp, "doc.pdf")
         with open(src, "wb") as fh:
             fh.write(html)
-        try:
-            subprocess.run(
-                [browser, "--headless=new", "--no-sandbox", "--disable-gpu",
-                 "--no-first-run", "--disable-background-networking",
-                 "--no-pdf-header-footer", f"--print-to-pdf={dst}", "file://" + src],
-                check=False, timeout=90, capture_output=True,
-            )
-        except subprocess.TimeoutExpired:
-            return None
-        if os.path.exists(dst) and os.path.getsize(dst) > 0:
-            with open(dst, "rb") as fh:
-                return fh.read()
+        # A fresh profile per render: with the default profile a second Chrome
+        # finds the first one's SingletonLock, hands off and exits with no PDF.
+        # That cost 5 of 8 renders in the 2026-09-21 backfill, silently.
+        for attempt in (1, 2):
+            profile = os.path.join(tmp, f"profile{attempt}")
+            try:
+                proc = subprocess.run(
+                    [browser, "--headless=new", "--no-sandbox", "--disable-gpu",
+                     "--no-first-run", "--disable-background-networking",
+                     f"--user-data-dir={profile}",
+                     "--no-pdf-header-footer", f"--print-to-pdf={dst}", "file://" + src],
+                    check=False, timeout=90, capture_output=True,
+                )
+                detail = f"exit {proc.returncode}: {proc.stderr.decode(errors='replace')[-300:]}"
+            except subprocess.TimeoutExpired:
+                detail = "timed out after 90s"
+            if os.path.exists(dst) and os.path.getsize(dst) > 0:
+                with open(dst, "rb") as fh:
+                    return fh.read()
+            log(f"[html_to_pdf] attempt {attempt} produced no PDF ({detail})")
     return None
 
 
