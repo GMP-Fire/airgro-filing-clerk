@@ -1324,6 +1324,17 @@ def main() -> int:
                     # The statement's identity is its filename (account + statement
                     # date). The school re-attaches old statements to reply threads,
                     # so a name already in the folder IS this statement - no download.
+                    if "{g:" in target_name:
+                        log(f"[{rule.id}] {zname}: attachment_re did not match, name unresolved; skipping")
+                        exceptions.append(
+                            (
+                                f"Filing Clerk: {rule.id} could not name {zname}",
+                                f"attachment_re in rule {rule.id} did not match {zname} (message {ref['id']}), "
+                                "so its {g:...} name tokens have no value. Nothing was filed.",
+                                f"filing-clerk/unresolved/{rule.id}",
+                            )
+                        )
+                        continue
                     stem = re.sub(r"\.pdf$", "", target_name, flags=re.I)
                     present = next(
                         (n for n in (target_name, stem + ".htm") if dest_index.has_name(n)), None
@@ -1423,9 +1434,27 @@ def main() -> int:
                     subject=subject,
                     attachment_name=filename,
                     sender=sender,
+                    groups=rule.groups_for(filename),
                 )
                 for filename, _, _ in attachments
             }
+            # A {g:name} token left in a name means attachment_re did not match this
+            # file. Never file "{g:date} ...pdf" - skip it and say so.
+            unresolved = [f for f, n in proposed.items() if "{g:" in n]
+            for f in unresolved:
+                log(f"[{rule.id}] {f}: attachment_re did not match, name unresolved; skipping")
+                exceptions.append(
+                    (
+                        f"Filing Clerk: {rule.id} could not name {f}",
+                        f"attachment_re in rule {rule.id} did not match {f} (message {ref['id']}), "
+                        "so its {g:...} name tokens have no value. Nothing was filed.",
+                        f"filing-clerk/unresolved/{rule.id}",
+                    )
+                )
+                del proposed[f]
+            attachments = [a for a in attachments if a[0] in proposed]
+            if not attachments:
+                continue
             resolved = disambiguate(proposed)
 
             # Where {date} came from, and what the document says its own month is.
